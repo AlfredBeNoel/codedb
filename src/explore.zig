@@ -1854,7 +1854,8 @@ pub const Explorer = struct {
     /// Graphs an exact upgrade replaced under a shared `mu`; readers may still
     /// hold them, so only an exclusive `mu` frees them.
     retired_call_graphs: std.ArrayList(CallGraph) = .empty,
-    /// Builds publish `call_graph` under a shared `mu`; readers copy it under this lock.
+    /// Builds publish `call_graph`, `call_graph_exact` and `call_centrality` under
+    /// a shared `mu`; readers copy them under this lock.
     call_graph_publish_mu: cio.Mutex = .{},
     centrality_build_mu: cio.Mutex = .{},
     root_dir: ?std.Io.Dir = null,
@@ -5350,7 +5351,7 @@ pub const Explorer = struct {
         var graph_dist: ?std.StringHashMap(u8) = null;
         if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
             cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null and
-            (self.call_graph != null or self.symbol_index.contains(query)))
+            (self.publishedCallGraph(false) != null or self.symbol_index.contains(query)))
         {
             self.ensureCallGraph();
             const ga = gd_arena.allocator();
@@ -5735,7 +5736,7 @@ pub const Explorer = struct {
     /// multiplier ≥ 1, never a filter, so a misresolved edge can only nudge a
     /// central file up, never drop a real result. alpha tuned via MRR.
     fn centralityBoost(self: *Explorer, path: []const u8) f32 {
-        const cm = self.call_centrality orelse return 1.0;
+        const cm = self.publishedCentrality() orelse return 1.0;
         const c = cm.get(path) orelse return 1.0;
         const alpha: f32 = 0.15;
         return 1.0 + alpha * @log(1.0 + c);
@@ -5746,7 +5747,7 @@ pub const Explorer = struct {
     /// each reached file's minimum hop distance. Arena-allocated; null when no
     /// graph is built or no term names a symbol, so ranking is unchanged.
     fn queryGraphDistances(self: *Explorer, terms: *const std.StringHashMap(void), ta: std.mem.Allocator) ?std.StringHashMap(u8) {
-        const cg = self.publishedCallGraph() orelse return null;
+        const cg = self.publishedCallGraph(false) orelse return null;
         const n = cg.node_name.len;
         if (n == 0) return null;
         const max_hops: u8 = 3;
@@ -6111,7 +6112,7 @@ pub const Explorer = struct {
     /// called while holding at least a shared lock on `mu`. Retains edges for
     /// codedb_callpath and computes per-file centrality (PageRank by default).
     fn ensureCallGraphMode(self: *Explorer, exact: bool) void {
-        if (self.call_graph != null and (!exact or self.call_graph_exact)) return;
+        if (self.publishedCallGraph(exact) != null) return;
         // #564: never build (and cache) a graph from a deferred symbol index —
         // resolveCallees would see no definitions and the empty graph would be
         // cached forever. Callers that need the graph ensureSymbolIndex first;
@@ -6343,6 +6344,7 @@ pub const Explorer = struct {
             return;
         };
 
+        var new_centrality: ?std.StringHashMap(f32) = null;
         if (self.call_centrality == null) {
             var cmap = std.StringHashMap(f32).init(self.allocator);
             for (node_path.items, node_scores.?) |path, score| {
@@ -6351,12 +6353,13 @@ pub const Explorer = struct {
                 if (!gop.found_existing) gop.value_ptr.* = 0;
                 gop.value_ptr.* += score;
             }
-            self.call_centrality = cmap;
+            new_centrality = cmap;
         }
 
         {
             self.call_graph_publish_mu.lock();
             defer self.call_graph_publish_mu.unlock();
+            if (new_centrality) |cmap| self.call_centrality = cmap;
             if (self.call_graph) |old| self.retired_call_graphs.appendAssumeCapacity(old);
             self.call_graph = .{
                 .edges = edges_owned,
@@ -6374,10 +6377,18 @@ pub const Explorer = struct {
     }
 
     /// Caller holds `mu` shared; the copy stays valid until an exclusive `mu`.
-    fn publishedCallGraph(self: *Explorer) ?CallGraph {
+    fn publishedCallGraph(self: *Explorer, exact_only: bool) ?CallGraph {
         self.call_graph_publish_mu.lock();
         defer self.call_graph_publish_mu.unlock();
+        if (exact_only and !self.call_graph_exact) return null;
         return self.call_graph;
+    }
+
+    /// Caller holds `mu` shared; the copy stays valid until an exclusive `mu`.
+    pub fn publishedCentrality(self: *Explorer) ?std.StringHashMap(f32) {
+        self.call_graph_publish_mu.lock();
+        defer self.call_graph_publish_mu.unlock();
+        return self.call_centrality;
     }
 
     fn ensureCallGraph(self: *Explorer) void {
@@ -6391,7 +6402,7 @@ pub const Explorer = struct {
     /// Build `call_centrality` once (idempotent, mutex-guarded). Must be called
     /// while holding at least a shared lock on `mu`.
     fn ensureCallCentrality(self: *Explorer) void {
-        if (self.call_centrality != null) return;
+        if (self.publishedCentrality() != null) return;
         self.ensureCallGraph();
     }
 
@@ -6422,7 +6433,7 @@ pub const Explorer = struct {
         defer self.mu.unlockShared();
 
         self.ensureExactCallGraph();
-        const cg = self.publishedCallGraph() orelse return try allocator.alloc(CallPathStep, 0);
+        const cg = self.publishedCallGraph(true) orelse return try allocator.alloc(CallPathStep, 0);
 
         var candidates: std.ArrayList(CallPathStep) = .empty;
         errdefer {
@@ -6458,7 +6469,7 @@ pub const Explorer = struct {
         defer self.mu.unlockShared();
 
         self.ensureExactCallGraph();
-        const cg = self.publishedCallGraph() orelse return null;
+        const cg = self.publishedCallGraph(true) orelse return null;
 
         var from_ids: std.ArrayList(codegraph.NodeId) = .empty;
         defer from_ids.deinit(allocator);
@@ -6619,7 +6630,7 @@ pub const Explorer = struct {
         if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
             cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null)
         {
-            if (self.call_graph == null) {
+            if (self.publishedCallGraph(false) == null) {
                 var gate_tok = idx.WordTokenizer{ .buf = query };
                 while (gate_tok.next()) |w| {
                     if (self.symbol_index.contains(w)) {

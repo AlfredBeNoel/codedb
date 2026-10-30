@@ -413,11 +413,12 @@ pub fn writeSnapshot(
     // under the shared lock held above; never builds here.
     {
         const offset = file_writer.logicalPos();
-        const count: u32 = if (explorer.call_centrality) |cm| @intCast(cm.count()) else 0;
+        const centrality = explorer.publishedCentrality();
+        const count: u32 = if (centrality) |cm| @intCast(cm.count()) else 0;
         var count_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &count_buf, count, .little);
         try fw.writeAll(&count_buf);
-        if (explorer.call_centrality) |cm| {
+        if (centrality) |cm| {
             var it = cm.iterator();
             while (it.next()) |e| {
                 const key = e.key_ptr.*;

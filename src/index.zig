@@ -2,6 +2,7 @@ const std = @import("std");
 const cio = @import("cio.zig");
 const ContentCache = @import("hot_cache.zig").ContentCache;
 const BBDictionary = @import("bbtree_dictionary.zig").Dictionary;
+const isolated_heap = @import("isolated_heap.zig");
 
 // ── Inverted word index ─────────────────────────────────────
 // Maps word → list of (path, line) hits. O(1) word lookup.
@@ -107,6 +108,11 @@ pub const WordIndex = struct {
         };
     }
 
+    /// For bulk-built indexes: a private heap that deinit hands back to the OS.
+    pub fn initIsolated(parent: std.mem.Allocator) WordIndex {
+        return init(isolated_heap.create(parent));
+    }
+
     pub fn deinit(self: *WordIndex) void {
         if (self.bb_dictionary) |*dictionary| dictionary.deinit();
         // Free hit lists and duped word keys (only the delta in mmap mode).
@@ -140,6 +146,7 @@ pub const WordIndex = struct {
             self.allocator.free(self.word_dir);
             cio.munmap(m);
         }
+        isolated_heap.destroy(self.allocator);
     }
 
     /// First write to an mmap index: index every base path so the heap code
@@ -796,16 +803,16 @@ pub const WordIndex = struct {
     const DISK_FORMAT_VERSION: u16 = 3;
 
     pub fn writeToDisk(self: *WordIndex, io: std.Io, dir_path: []const u8, git_head: ?[40]u8) !void {
-        _ = try self.writeToDiskInner(io, dir_path, git_head, false);
+        _ = try self.writeToDiskInner(io, dir_path, git_head, null);
     }
 
     /// writeToDisk, then mmap the written file through the still-open handle, so
     /// the result matches these bytes even if another process replaces word.index.
-    pub fn writeToDiskAndMap(self: *WordIndex, io: std.Io, dir_path: []const u8, git_head: ?[40]u8) !?WordIndex {
-        return self.writeToDiskInner(io, dir_path, git_head, true);
+    pub fn writeToDiskAndMap(self: *WordIndex, io: std.Io, dir_path: []const u8, git_head: ?[40]u8, map_allocator: std.mem.Allocator) !?WordIndex {
+        return self.writeToDiskInner(io, dir_path, git_head, map_allocator);
     }
 
-    fn writeToDiskInner(self: *WordIndex, io: std.Io, dir_path: []const u8, git_head: ?[40]u8, map_result: bool) !?WordIndex {
+    fn writeToDiskInner(self: *WordIndex, io: std.Io, dir_path: []const u8, git_head: ?[40]u8, map_allocator: ?std.mem.Allocator) !?WordIndex {
         var file_table: std.ArrayList([]const u8) = .empty;
         defer file_table.deinit(self.allocator);
         const doc_to_disk = try self.allocator.alloc(u32, self.id_to_path.items.len);
@@ -845,7 +852,7 @@ pub const WordIndex = struct {
         const final_path = try std.fmt.allocPrint(self.allocator, "{s}/word.index", .{dir_path});
         defer self.allocator.free(final_path);
 
-        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .read = map_result });
+        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .read = map_allocator != null });
         defer file.close(io);
 
         var file_buf: [256 * 1024]u8 = undefined;
@@ -900,8 +907,7 @@ pub const WordIndex = struct {
         try writer.interface.flush();
 
         try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), final_path, io);
-        if (!map_result) return null;
-        var mapped = (mmapFromFile(io, file, self.allocator) catch return null) orelse return null;
+        var mapped = (mmapFromFile(io, file, map_allocator orelse return null) catch return null) orelse return null;
         mapped.enableBBDictionary() catch {};
         return mapped;
     }

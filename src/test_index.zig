@@ -3374,6 +3374,10 @@ test "mmap word index: zero-copy load matches heap load and keeps the base on wr
     try testing.expect((try mm.search("alphaToken", testing.allocator)).items.len >= 1);
 }
 
+test {
+    _ = @import("isolated_heap.zig");
+}
+
 fn wordHitSet(wi: *WordIndex, word: []const u8, arena: std.mem.Allocator) ![]const u8 {
     const hits = try wi.search(word, arena);
     var lines: std.ArrayList([]const u8) = .empty;
@@ -3453,7 +3457,7 @@ test "mmap word index: edits overlay the base and match a rebuilt index" {
     defer tmp2.cleanup();
     var pb2: [std.fs.max_path_bytes]u8 = undefined;
     const dir2 = pb2[0..try tmp2.dir.realPathFile(io, ".", &pb2)];
-    var remapped = (try mm.writeToDiskAndMap(io, dir2, null)).?;
+    var remapped = (try mm.writeToDiskAndMap(io, dir2, null, alloc)).?;
     defer remapped.deinit();
     var reread = WordIndex.readFromDisk(io, dir2, alloc).?;
     defer reread.deinit();

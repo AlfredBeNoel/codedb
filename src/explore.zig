@@ -1836,6 +1836,9 @@ pub const Explorer = struct {
     /// merge them after the commit loop (see watcher.initialScanWithWorkerCount).
     defer_word_index: bool = false,
     mu: cio.RwLock = .{},
+    /// One full word-index rebuild at a time: the warmup thread and the first
+    /// query would otherwise each build a complete index concurrently.
+    word_index_rebuild_mu: cio.Mutex = .{},
     /// Per-file call-graph centrality (PageRank by default, or in-degree when
     /// CODEDB_IN_DEGREE_CENTRALITY is set). Built lazily, used as an additive
     /// ranking boost in searchContentRanked. Null until built; guarded by
@@ -2026,7 +2029,7 @@ pub const Explorer = struct {
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
             .symbol_index_complete = true,
             .def_token_index = std.StringHashMap(std.ArrayList(u32)).init(allocator),
-            .word_index = WordIndex.init(allocator),
+            .word_index = WordIndex.initIsolated(allocator),
             .trigram_index = .{ .heap = TrigramIndex.init(allocator) },
             .skip_trigram_files = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
@@ -2873,10 +2876,14 @@ pub const Explorer = struct {
     /// by streaming source files from the project root when the content cache
     /// was capped during fast snapshot restore.
     pub fn rebuildWordIndex(self: *Explorer) !void {
+        self.word_index_rebuild_mu.lock();
+        defer self.word_index_rebuild_mu.unlock();
         const source_paths = blk: {
             self.mu.lockShared();
             defer self.mu.unlockShared();
 
+            // A rebuild that finished while this caller waited already did the work.
+            if (self.word_index_complete) return;
             if (self.contents.len() == self.outlines.count()) break :blk null;
             if (self.io == null or self.root_dir == null) return error.WordIndexIncomplete;
 
@@ -2897,18 +2904,21 @@ pub const Explorer = struct {
             self.allocator.free(paths);
         };
 
-        var rebuilt = WordIndex.init(self.allocator);
+        var rebuilt = WordIndex.initIsolated(self.allocator);
         errdefer rebuilt.deinit();
 
         if (source_paths) |paths| {
             const io = self.io orelse return error.WordIndexIncomplete;
             const dir = self.root_dir orelse return error.WordIndexIncomplete;
             const canonical_root = self.root_path orelse return error.WordIndexIncomplete;
+            // One reused page-backed buffer: freed malloc blocks for every file
+            // would stay dirty after the rebuild.
+            var read_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer read_arena.deinit();
             for (paths) |path| {
-                const content = try project_file.readAllocNoFollowAtRoot(io, dir, canonical_root, path, self.allocator, .limited(64 * 1024 * 1024));
-                errdefer self.allocator.free(content);
+                _ = read_arena.reset(.retain_capacity);
+                const content = try project_file.readAllocNoFollowAtRoot(io, dir, canonical_root, path, read_arena.allocator(), .limited(64 * 1024 * 1024));
                 try rebuilt.indexFile(path, content);
-                self.allocator.free(content);
             }
         } else {
             self.mu.lockShared();

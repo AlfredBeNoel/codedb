@@ -23,6 +23,8 @@ const ready_timeout_ms: i64 = 30 * 1000;
 /// The fd number the spawned server finds its inherited lock on.
 const inherited_lock_fd: c_int = 3;
 const listen_backlog = 128;
+/// A connected peer that sends no hello in this time holds no session slot.
+const hello_timeout_ms: i64 = 10 * 1000;
 
 /// Knobs that choose the endpoint or the server lifetime, not what a session
 /// returns, so clients that differ only in these still share one server.
@@ -85,25 +87,35 @@ pub const Endpoint = struct {
     dir_buf: [std.fs.max_path_bytes]u8 = undefined,
     dir_len: usize = 0,
 
-    /// Null when no usable socket directory exists or its socket path would
-    /// not fit in sockaddr_un.
-    pub fn init(io: std.Io, key: u64) ?Endpoint {
+    pub fn init(io: std.Io, key: u64) Unavailable!Endpoint {
         var ep = Endpoint{ .key = key };
-        const dir = socketDir(&ep.dir_buf) orelse return null;
+        const dir = socketDir(&ep.dir_buf) orelse return error.NoSocketDir;
         ep.dir_len = dir.len;
         if (std.fs.path.dirname(dir)) |parent| std.Io.Dir.cwd().createDirPath(io, parent) catch {};
         var dir_z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        const dir_z = cio.bufPrintZ(&dir_z_buf, "{s}", .{dir}) catch return null;
+        const dir_z = cio.bufPrintZ(&dir_z_buf, "{s}", .{dir}) catch return error.NoSocketDir;
         _ = std.c.mkdir(dir_z.ptr, 0o700);
         var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const sock = ep.path(&sock_buf, "sock") orelse return null;
-        _ = cli_proxy.cliFillSockaddr(sock) orelse return null;
+        const sock = ep.path(&sock_buf, "sock") orelse return error.SocketPathTooLong;
+        // sockaddr_un holds 104 bytes on macOS, 108 on Linux.
+        _ = cli_proxy.cliFillSockaddr(sock) orelse return error.SocketPathTooLong;
         return ep;
     }
 
     pub fn path(self: *const Endpoint, buf: []u8, ext: []const u8) ?[:0]const u8 {
         return cio.bufPrintZ(buf, "{s}/{x:0>16}.{s}", .{ self.dir_buf[0..self.dir_len], self.key, ext }) catch null;
     }
+};
+
+/// Why a client serves in-process; logged so a fallback is never silent.
+const Unavailable = error{
+    NoSocketDir,
+    SocketPathTooLong,
+    SocketDirNotWritable,
+    ServerRefused,
+    SpawnFailed,
+    ServerExitedBeforeListening,
+    ConnectTimeout,
 };
 
 fn socketDir(buf: []u8) ?[]const u8 {
@@ -141,10 +153,9 @@ pub fn forward(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8, c
         if (std.mem.eql(u8, v, "0")) return null;
     }
     const key = serverKey(abs_root, cfg, no_telemetry, processEnvFingerprint());
-    const ep = Endpoint.init(io, key) orelse return null;
     const spawn = SpawnArgs{ .io = io, .allocator = allocator, .abs_root = abs_root, .no_telemetry = no_telemetry, .config_file = config_file };
-    const conn = connectOrSpawn(&ep, spawn) orelse {
-        std.log.info("codedb mcp: shared server unavailable, serving in-process", .{});
+    const conn = connectOrSpawn(io, key, spawn) catch |err| {
+        std.log.info("codedb mcp: shared server unavailable ({s}), serving in-process", .{@errorName(err)});
         return null;
     };
     return pump(conn);
@@ -158,38 +169,39 @@ const SpawnArgs = struct {
     config_file: ?[]const u8,
 };
 
-fn connectOrSpawn(ep: *const Endpoint, spawn: SpawnArgs) ?c_int {
+fn connectOrSpawn(io: std.Io, key: u64, spawn: SpawnArgs) Unavailable!c_int {
+    const ep = try Endpoint.init(io, key);
     var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
     var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
     var log_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sock = ep.path(&sock_buf, "sock") orelse return null;
-    const lock = ep.path(&lock_buf, "lock") orelse return null;
-    const log = ep.path(&log_buf, "log") orelse return null;
+    const sock = ep.path(&sock_buf, "sock") orelse return error.SocketPathTooLong;
+    const lock = ep.path(&lock_buf, "lock") orelse return error.SocketPathTooLong;
+    const log = ep.path(&log_buf, "log") orelse return error.SocketPathTooLong;
 
     const deadline = cio.milliTimestamp() + connect_timeout_ms;
     var spawned = false;
     var backoff_ms: u64 = 5;
     while (cio.milliTimestamp() < deadline) {
-        switch (attach(sock, ep.key)) {
+        switch (attach(sock, key)) {
             .ready => |fd| return fd,
-            .refused => return null,
+            .refused => return error.ServerRefused,
             .absent => {},
         }
         switch (lockServer(lock)) {
-            .unavailable => return null,
+            .unavailable => return error.SocketDirNotWritable,
             .held => {},
             .acquired => |lock_fd| {
                 defer _ = std.c.close(lock_fd);
                 // The lock is free again only if the server we started died.
-                if (spawned) return null;
-                if (!spawnServer(spawn, lock_fd, log)) return null;
+                if (spawned) return error.ServerExitedBeforeListening;
+                if (!spawnServer(spawn, lock_fd, log)) return error.SpawnFailed;
                 spawned = true;
             },
         }
         cio.sleepMs(backoff_ms);
         backoff_ms = @min(backoff_ms * 2, 50);
     }
-    return null;
+    return error.ConnectTimeout;
 }
 
 const Attach = union(enum) {
@@ -385,7 +397,7 @@ pub const Server = struct {
     pub fn bind(io: std.Io, abs_root: []const u8, cfg: Config, no_telemetry: bool, inherited_lock: ?c_int, idle_ms: i64) ?Server {
         if (comptime !supported) return null;
         const key = serverKey(abs_root, cfg, no_telemetry, processEnvFingerprint());
-        const ep = Endpoint.init(io, key) orelse return null;
+        const ep = Endpoint.init(io, key) catch return null;
         var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
         const lock_path = ep.path(&lock_buf, "lock") orelse return null;
         const lock_fd = inherited_lock orelse switch (lockServer(lock_path)) {
@@ -415,6 +427,10 @@ pub const Server = struct {
     /// Admission and the idle verdict share this thread, so a client accepted
     /// before the verdict always keeps the server alive.
     pub fn serve(self: *Server, handler: anytype) void {
+        // The index load ran before this; clients queued during it count as new.
+        self.mu.lock();
+        self.idle_since_ms = cio.milliTimestamp();
+        self.mu.unlock();
         while (!self.idleExpired(cio.milliTimestamp())) {
             var fds = [_]std.c.pollfd{.{ .fd = self.listen_fd, .events = std.c.POLL.IN, .revents = 0 }};
             if (std.c.poll(&fds, 1, 250) <= 0) continue;
@@ -434,6 +450,9 @@ pub const Server = struct {
         }
         _ = std.c.unlink(self.sockPath().ptr);
         _ = std.c.close(self.listen_fd);
+        // A newer client may start the next server while this one shuts down.
+        _ = std.c.close(self.lock_fd);
+        self.lock_fd = -1;
         std.log.info("codedb mcp-server: idle for {d}ms with no clients, exiting", .{self.idle_ms});
     }
 
@@ -446,7 +465,7 @@ pub const Server = struct {
     fn greet(self: *const Server, conn: c_int) bool {
         var expected_buf: [64]u8 = undefined;
         var got_buf: [64]u8 = undefined;
-        const got = switch (readLine(conn, &got_buf, std.math.maxInt(i64))) {
+        const got = switch (readLine(conn, &got_buf, cio.milliTimestamp() + hello_timeout_ms)) {
             .line => |line| line,
             .closed, .timeout => return false,
         };
@@ -508,6 +527,17 @@ test "mcp shared: server key separates roots, configs and telemetry" {
     try testing.expect(key != serverKey("/repo", small, false, 0));
 }
 
+test "mcp shared: a socket path beyond sockaddr_un is refused, not truncated" {
+    if (comptime !supported) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const prev_dir = cio.posixGetenv("CODEDB_MCP_SOCKET_DIR");
+    defer if (prev_dir) |d| cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", d) else cio.posixUnsetenv("CODEDB_MCP_SOCKET_DIR");
+    const long_dir = "/nonexistent-codedb-test/" ++ @as([96]u8, @splat('d'));
+    cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", long_dir);
+    try testing.expectError(error.SocketPathTooLong, Endpoint.init(threaded.io(), 1));
+}
+
 test "mcp shared: lock fd argument parsing" {
     try testing.expectEqual(@as(?c_int, 3), inheritedLockFd(&.{ "--no-telemetry", "--lock-fd=3" }));
     try testing.expectEqual(@as(?c_int, null), inheritedLockFd(&.{"--lock-fd=x"}));
@@ -545,7 +575,6 @@ test "mcp shared: server greets, serves, and retires once idle" {
     defer if (prev_dir) |d| cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", d) else cio.posixUnsetenv("CODEDB_MCP_SOCKET_DIR");
 
     var server = Server.bind(io, "/shared-test-root", Config.default, true, null, 300) orelse return error.TestUnexpectedResult;
-    defer _ = std.c.close(server.lock_fd);
     try testing.expect(Server.bind(io, "/shared-test-root", Config.default, true, null, 300) == null);
 
     var returned = std.atomic.Value(bool).init(false);
@@ -569,4 +598,8 @@ test "mcp shared: server greets, serves, and retires once idle" {
 
     serve_thread.join();
     try testing.expect(attach(server.sockPath(), server.key) == .absent);
+    // serve released the key, so the next server can take it at once.
+    const next = Server.bind(io, "/shared-test-root", Config.default, true, null, 300) orelse return error.TestUnexpectedResult;
+    _ = std.c.close(next.listen_fd);
+    _ = std.c.close(next.lock_fd);
 }

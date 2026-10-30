@@ -3329,6 +3329,29 @@ test "call paths resolve from disk after contents are released" {
     for (expected, path) |name, step| try testing.expectEqualStrings(name, step.name);
 }
 
+test "trigramAdmits keeps admission for indexed files and caps new ones" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("admitted.zig", "pub fn admitted() void {}\n");
+    try explorer_inst.indexFileSkipTrigram("skipped.zig", "pub fn skipped() void {}\n");
+
+    try testing.expect(explorer_inst.trigramAdmits("admitted.zig", 1));
+    try testing.expect(!explorer_inst.trigramAdmits("skipped.zig", 100));
+    try testing.expect(!explorer_inst.trigramAdmits("new.zig", 1));
+    try testing.expect(explorer_inst.trigramAdmits("new.zig", 2));
+}
+
+test "removeFileIfIndexed leaves search caches alone for unknown paths" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("kept.zig", "pub fn kept() void {}\n");
+    const gen = explorer_inst.search_gen.load(.acquire);
+    explorer_inst.removeFileIfIndexed("never_indexed.zig");
+    try testing.expectEqual(gen, explorer_inst.search_gen.load(.acquire));
+    explorer_inst.removeFileIfIndexed("kept.zig");
+    try testing.expect(!explorer_inst.outlines.contains("kept.zig"));
+}
+
 test "Swift multiline bodies and initializers participate in call paths" {
     var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer_inst.deinit();

@@ -1323,7 +1323,8 @@ def run_scenario_9_bootstrap_temp_read(binary: str) -> list[TestResult]:
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 def run_scenario_10_branch_switch_reconcile(binary: str, project: str) -> list[TestResult]:
-    """git checkout updates changed, added and deleted files and leaves the rest indexed."""
+    """git checkout updates changed, added, deleted, binary and oversized files, keeps the
+    rest indexed and keeps the trigram cap."""
     results: list[TestResult] = []
 
     def t(name: str) -> TestResult:
@@ -1335,8 +1336,8 @@ def run_scenario_10_branch_switch_reconcile(binary: str, project: str) -> list[T
         subprocess.run(["git", "-c", "user.name=e2e", "-c", "user.email=e2e@example.invalid", *args],
                        cwd=root, check=True, capture_output=True)
 
-    def status_seq(p: MCPProcess) -> int:
-        m = re.search(r"seq: (\d+)", tool_text(p.call_tool("codedb_status", {})))
+    def status_number(p: MCPProcess, pattern: str) -> int:
+        m = re.search(pattern, tool_text(p.call_tool("codedb_status", {})))
         return int(m.group(1)) if m else -1
 
     unchanged = 80
@@ -1348,16 +1349,22 @@ def run_scenario_10_branch_switch_reconcile(binary: str, project: str) -> list[T
             (root / f"stable_{i}.py").write_text(f"def stable_fn_{i}():\n    return {i}\n")
         (root / "shared.py").write_text("def shared_base_marker():\n    return 'base'\n")
         (root / "gone.py").write_text("def gone_only_on_base():\n    return 'gone'\n")
+        (root / "turns_binary.py").write_text("def binary_on_alt_marker():\n    return 1\n")
+        (root / "turns_huge.py").write_text("def huge_on_alt_marker():\n    return 1\n")
         git(root, "add", "-A")
         git(root, "commit", "-q", "-m", "base")
         git(root, "checkout", "-q", "-b", "alt")
         (root / "shared.py").write_text("def shared_alt_marker():\n    return 'alt'\n")
         (root / "gone.py").unlink()
         (root / "fresh.py").write_text("def fresh_only_on_alt():\n    return 'fresh'\n")
+        (root / "turns_binary.py").write_bytes(b"\x00\x01def binary_on_alt_marker():\n")
+        (root / "turns_huge.py").write_text("def huge_on_alt_marker():\n" + "x = 1\n" * 400_000)
         git(root, "add", "-A")
         git(root, "commit", "-q", "-m", "alt")
         git(root, "checkout", "-q", "base")
-        p = MCPProcess(binary, [], cwd="/", command=[binary, str(root), "mcp", "--no-telemetry"])
+        # A cap below the file count leaves later files outside the trigram index.
+        p = MCPProcess(binary, [], cwd="/", command=[binary, str(root), "mcp", "--no-telemetry"],
+                       env={**os.environ, "CODEDB_TRIGRAM_CAP": str(unchanged // 2)})
 
         try:
             r = t("initial scan completes")
@@ -1369,7 +1376,8 @@ def run_scenario_10_branch_switch_reconcile(binary: str, project: str) -> list[T
             # The watcher records the baseline HEAD after it logs its mode.
             watching = wait_until(lambda: any("watcher:" in l for l in p.stderr_lines()), timeout=15.0)
             time.sleep(1.0)
-            seq_before = status_seq(p)
+            seq_before = status_number(p, r"seq: (\d+)")
+            trigram_before = status_number(p, r"trigram_index: \S+ \((\d+) files\)")
             git(root, "checkout", "-q", "alt")
             r = t("watcher sees the HEAD change")
             if watching and wait_until(lambda: any("git HEAD changed" in l for l in p.stderr_lines()), timeout=15.0):
@@ -1400,19 +1408,44 @@ def run_scenario_10_branch_switch_reconcile(binary: str, project: str) -> list[T
             else:
                 r.fail("gone.py still indexed")
 
+            r = t("file that turned binary drops its old symbols")
+            if wait_until(lambda: not symbol_has("binary_on_alt_marker", "turns_binary.py")):
+                r.ok()
+            else:
+                r.fail("turns_binary.py still serves its text symbols")
+
+            r = t("file that grew past the size cap drops its old symbols")
+            if wait_until(lambda: not symbol_has("huge_on_alt_marker", "turns_huge.py")):
+                r.ok()
+            else:
+                r.fail("turns_huge.py still serves its old symbols")
+
+            r = t("search finds the added file outside the trigram cap")
+            if "fresh.py" in tool_text(p.call_tool("codedb_search", {"query": "fresh_only_on_alt"})):
+                r.ok()
+            else:
+                r.fail("codedb_search misses fresh.py")
+
+            trigram_after = status_number(p, r"trigram_index: \S+ \((\d+) files\)")
+            r = t("checkout keeps the trigram cap")
+            if 0 <= trigram_after <= trigram_before:
+                r.ok(f"{trigram_before} -> {trigram_after} files")
+            else:
+                r.fail(f"trigram files {trigram_before} -> {trigram_after}")
+
             r = t("unchanged files stay indexed")
             if symbol_has("stable_fn_7", "stable_7.py"):
                 r.ok()
             else:
                 r.fail("stable_7.py lost from the index")
 
-            # A full re-read records one version per file; a reconcile records the 3 changes.
-            delta = status_seq(p) - seq_before
+            # A full re-read records one version per file; a reconcile records the 5 changes.
+            delta = status_number(p, r"seq: (\d+)") - seq_before
             r = t("checkout does not re-index unchanged files")
             if 0 <= delta < unchanged // 2:
                 r.ok(f"seq +{delta}")
             else:
-                r.fail(f"seq +{delta} for 3 changed files")
+                r.fail(f"seq +{delta} for 5 changed files")
         finally:
             p.close()
 

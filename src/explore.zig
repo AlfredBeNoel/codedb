@@ -3136,6 +3136,26 @@ pub const Explorer = struct {
         }
     }
 
+    /// removeFile for a path that may never have been indexed; skips the search
+    /// cache invalidation when there is nothing to drop.
+    pub fn removeFileIfIndexed(self: *Explorer, path: []const u8) void {
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            if (!self.outlines.contains(path)) return;
+        }
+        self.removeFile(path);
+    }
+
+    /// Live updates keep a file's trigram admission and admit new files only
+    /// below `cap`, so edits and checkouts honor the scan-time cap.
+    pub fn trigramAdmits(self: *Explorer, path: []const u8, cap: usize) bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        if (self.outlines.contains(path)) return !self.skip_trigram_files.contains(path);
+        return self.trigram_index.fileCount() < cap;
+    }
+
     pub fn getOutline(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) !?FileOutline {
         self.mu.lockShared();
         defer self.mu.unlockShared();

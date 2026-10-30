@@ -132,6 +132,25 @@ fn rememberDirState(dirs: *DirMap, persistent: std.mem.Allocator, rel: []const u
     dirs.put(key, state) catch persistent.free(key);
 }
 
+/// The reconcile only adds directories, so a checkout that drops a tree must
+/// prune it here or every historical directory stays armed and re-listed.
+fn pruneVanishedDirs(io: std.Io, root_dir: std.Io.Dir, dirs: *DirMap, persistent: std.mem.Allocator) void {
+    var vanished: std.ArrayList([]const u8) = .empty;
+    defer vanished.deinit(persistent);
+    var it = dirs.keyIterator();
+    while (it.next()) |path| {
+        if (path.len == 0) continue;
+        const st = root_dir.statFile(io, path.*, .{}) catch {
+            vanished.append(persistent, path.*) catch return;
+            continue;
+        };
+        if (st.kind != .directory) vanished.append(persistent, path.*) catch return;
+    }
+    for (vanished.items) |path| {
+        if (dirs.fetchRemove(path)) |kv| persistent.free(kv.key);
+    }
+}
+
 const InitialScanEntry = struct {
     path: []u8,
     size: u64,
@@ -2198,6 +2217,27 @@ fn armAndCloseGap(
     watch.arm(io, root_dir, known, dirs);
 }
 
+test "pruneVanishedDirs drops removed and retyped directories only" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "kept/nested");
+    try tmp.dir.writeFile(io, .{ .sub_path = "was_dir", .data = "now a file\n" });
+    var dirs = DirMap.init(testing.allocator);
+    defer {
+        var it = dirs.keyIterator();
+        while (it.next()) |key| testing.allocator.free(key.*);
+        dirs.deinit();
+    }
+    for ([_][]const u8{ "", "kept", "kept/nested", "gone", "gone/child", "was_dir" }) |path| {
+        try dirs.put(try testing.allocator.dupe(u8, path), .{ .mtime_ns = 0, .ctime_ns = 0, .inode = 0 });
+    }
+    pruneVanishedDirs(io, tmp.dir, &dirs, testing.allocator);
+    try testing.expectEqual(@as(u32, 3), dirs.count());
+    for ([_][]const u8{ "", "kept", "kept/nested" }) |path| try testing.expect(dirs.contains(path));
+}
+
 test "rearm directory matching excludes fallback files and unrelated prefixes" {
     if (!(comptime watch_kqueue or watch_inotify)) return error.SkipZigTest;
     const testing = std.testing;
@@ -2732,6 +2772,7 @@ pub fn incrementalLoop(io: std.Io, store: *Store, explorer: *Explorer, queue: *E
             last_git_head = current_head;
             // A checkout rewrites only differing files, which the full metadata diff
             // finds; re-reading every file emptied the index and moved it all to heap.
+            pruneVanishedDirs(io, stable_root, &dirs, backing);
             armAndCloseGap(io, &watch, stable_root, store, explorer, queue, &known, &dirs, root, backing);
             if (recursive != null) watch.reset(io);
             continue;
@@ -2796,8 +2837,13 @@ pub fn incrementalLoop(io: std.Io, store: *Store, explorer: *Explorer, queue: *E
 /// hashAndIndexFile so the binary + trigram rules live in one spot.
 fn indexContentBuffer(explorer: *Explorer, path: []const u8, content: []const u8, skip_trigram: bool) !void {
     const check_len = @min(content.len, 512);
-    if (std.mem.indexOfScalar(u8, content[0..check_len], 0) != null) return; // binary
-    const effective_skip_trigram = skip_trigram or (content.len > max_trigram_file_bytes);
+    if (std.mem.indexOfScalar(u8, content[0..check_len], 0) != null) {
+        // A file that turned binary must not keep serving its old text.
+        explorer.removeFileIfIndexed(path);
+        return;
+    }
+    const effective_skip_trigram = skip_trigram or (content.len > max_trigram_file_bytes) or
+        !explorer.trigramAdmits(path, trigramFileCap());
     if (effective_skip_trigram) {
         try explorer.indexFileSkipTrigram(path, content);
     } else {
@@ -2816,7 +2862,10 @@ fn indexContentBuffer(explorer: *Explorer, path: []const u8, content: []const u8
 /// `size` is the caller's already-stat'd size, so there is no extra stat here.
 fn hashAndIndexFile(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: []const u8, size: u64) u64 {
     if (shouldSkipFile(path)) return 0;
-    if (size > max_indexed_file_bytes) return 0;
+    if (size > max_indexed_file_bytes) {
+        explorer.removeFileIfIndexed(path);
+        return 0;
+    }
     var content_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer content_arena.deinit();
     const content = project_file.readAllocNoFollow(io, dir, path, content_arena.allocator(), .limited(max_indexed_file_bytes)) catch return std.math.maxInt(u64);
@@ -3016,7 +3065,11 @@ fn applyKnownFile(
     old.hash = hash;
     store.noteMtime(logical_path, mtime);
     if (FsEvent.init(stable_path, .modified, seq)) |ev| pushEventOrWait(queue, ev);
-    if (content) |buf| indexContentBuffer(explorer, stable_path, buf, false) catch {};
+    if (content) |buf| {
+        indexContentBuffer(explorer, stable_path, buf, false) catch {};
+    } else if (stat.size > max_indexed_file_bytes) {
+        explorer.removeFileIfIndexed(stable_path);
+    }
 }
 
 const ParentIndex = struct {

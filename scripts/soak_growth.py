@@ -54,8 +54,10 @@ def prepare_corpus(source, root, rng, alt_files):
     git(root, 'config', 'core.fsmonitor', 'false')
     git(root, 'add', '-A')
     git(root, 'commit', '-q', '-m', 'base', '--no-verify')
+    # Symlinks are never edited: an absolute link would write into the source repo.
     tracked = [p for p in git(root, 'ls-files').stdout.splitlines()
-               if Path(p).suffix in SOURCE_SUFFIXES and (root / p).stat().st_size < 200_000]
+               if Path(p).suffix in SOURCE_SUFFIXES and not (root / p).is_symlink()
+               and (root / p).lstat().st_size < 200_000]
     tracked.sort()
     git(root, 'checkout', '-q', '-b', 'alt')
     picks = rng.sample(tracked, min(alt_files, len(tracked)))

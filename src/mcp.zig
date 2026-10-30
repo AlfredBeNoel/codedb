@@ -2776,12 +2776,12 @@ fn handleCallpath(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
         out.appendSlice(alloc, "error: callpath search failed") catch {};
         return;
     };
-    defer alloc.free(from_candidates);
+    defer Explorer.freeCallPathSteps(alloc, from_candidates);
     const to_candidates = explorer.findCallPathCandidates(to_name, to_path, alloc) catch {
         out.appendSlice(alloc, "error: callpath search failed") catch {};
         return;
     };
-    defer alloc.free(to_candidates);
+    defer Explorer.freeCallPathSteps(alloc, to_candidates);
 
     const w = cio.listWriter(out, alloc);
     if (from_candidates.len == 0) {
@@ -2814,7 +2814,7 @@ fn handleCallpath(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
         w.print("no call path from '{s}' to '{s}' within {d} hops\n", .{ from_name, to_name, max_hops }) catch {};
         return;
     };
-    defer alloc.free(path);
+    defer Explorer.freeCallPathSteps(alloc, path);
 
     w.print("call path ({d} hops): {s} → {s}\n", .{ path.len - 1, from_name, to_name }) catch {};
     for (path, 0..) |step, i| {

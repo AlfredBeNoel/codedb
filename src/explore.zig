@@ -6370,17 +6370,16 @@ pub const Explorer = struct {
         const cg = self.call_graph orelse return try allocator.alloc(CallPathStep, 0);
 
         var candidates: std.ArrayList(CallPathStep) = .empty;
-        errdefer candidates.deinit(allocator);
+        errdefer {
+            freeCallPathStepStrings(allocator, candidates.items);
+            candidates.deinit(allocator);
+        }
         for (cg.node_name, 0..) |node_name, id| {
             if (!std.mem.eql(u8, node_name, name)) continue;
             if (path) |selected_path| {
                 if (!std.mem.eql(u8, cg.node_path[id], selected_path)) continue;
             }
-            try candidates.append(allocator, .{
-                .path = cg.node_path[id],
-                .name = node_name,
-                .line = cg.node_line[id],
-            });
+            try candidates.append(allocator, try ownedCallPathStep(allocator, cg, id));
         }
         return try candidates.toOwnedSlice(allocator);
     }
@@ -6433,15 +6432,32 @@ pub const Explorer = struct {
         defer allocator.free(path);
 
         var steps: std.ArrayList(CallPathStep) = .empty;
-        errdefer steps.deinit(allocator);
-        for (path) |nid| {
-            try steps.append(allocator, .{
-                .path = cg.node_path[nid],
-                .name = cg.node_name[nid],
-                .line = cg.node_line[nid],
-            });
+        errdefer {
+            freeCallPathStepStrings(allocator, steps.items);
+            steps.deinit(allocator);
         }
+        for (path) |nid| try steps.append(allocator, try ownedCallPathStep(allocator, cg, nid));
         return try steps.toOwnedSlice(allocator);
+    }
+
+    /// Frees a result of findCallPath, findCallPathScoped or findCallPathCandidates.
+    pub fn freeCallPathSteps(allocator: std.mem.Allocator, steps: []CallPathStep) void {
+        freeCallPathStepStrings(allocator, steps);
+        allocator.free(steps);
+    }
+
+    fn freeCallPathStepStrings(allocator: std.mem.Allocator, steps: []const CallPathStep) void {
+        for (steps) |step| {
+            allocator.free(step.path);
+            allocator.free(step.name);
+        }
+    }
+
+    /// Results outlive `mu`, and any edit or delete frees the graph's strings.
+    fn ownedCallPathStep(allocator: std.mem.Allocator, cg: CallGraph, id: usize) !CallPathStep {
+        const path = try allocator.dupe(u8, cg.node_path[id]);
+        errdefer allocator.free(path);
+        return .{ .path = path, .name = try allocator.dupe(u8, cg.node_name[id]), .line = cg.node_line[id] };
     }
 
     pub fn searchContentRanked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {

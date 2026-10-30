@@ -338,6 +338,8 @@ def main():
     ap.add_argument('--keep', action='store_true')
     ap.add_argument('--spike-mb', type=float, default=0, help='save one `sample` stack when footprint first exceeds this')
     ap.add_argument('--max-stalls', type=int, default=3, help='stop after this many timed-out tool calls')
+    ap.add_argument('--server-env', action='append', default=[], metavar='KEY=VALUE',
+                    help='extra env for the measured server only, e.g. MallocStackLogging=lite')
     args = ap.parse_args()
     out_path = Path(args.out).resolve()
     if out_path.exists():
@@ -371,7 +373,8 @@ def main():
             time.sleep(20)
             warm.close()
             procs.remove(warm)
-        p = MCPProcess(binary, [], str(root), command=[binary, 'mcp'], env=env)
+        p = MCPProcess(binary, [], str(root), command=[binary, 'mcp'],
+                       env=env | dict(kv.split('=', 1) for kv in args.server_env))
         procs.append(p)
         fp = Footprint(p.proc.pid, args.interval, work, args.spike_mb, out_path.with_suffix('.spike.txt'))
         fp.phase = 'startup'

@@ -6379,7 +6379,8 @@ pub const Explorer = struct {
             if (path) |selected_path| {
                 if (!std.mem.eql(u8, cg.node_path[id], selected_path)) continue;
             }
-            try candidates.append(allocator, try ownedCallPathStep(allocator, cg, id));
+            try candidates.ensureUnusedCapacity(allocator, 1);
+            candidates.appendAssumeCapacity(try ownedCallPathStep(allocator, cg, id));
         }
         return try candidates.toOwnedSlice(allocator);
     }
@@ -6436,7 +6437,8 @@ pub const Explorer = struct {
             freeCallPathStepStrings(allocator, steps.items);
             steps.deinit(allocator);
         }
-        for (path) |nid| try steps.append(allocator, try ownedCallPathStep(allocator, cg, nid));
+        try steps.ensureTotalCapacity(allocator, path.len);
+        for (path) |nid| steps.appendAssumeCapacity(try ownedCallPathStep(allocator, cg, nid));
         return try steps.toOwnedSlice(allocator);
     }
 

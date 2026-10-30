@@ -579,6 +579,11 @@ pub const RunOptions = struct {
 };
 extern "c" fn _NSGetEnviron() *[*:null]?[*:0]u8;
 
+/// The live process environment as a NULL-terminated "NAME=VALUE" array (POSIX).
+pub fn environ() [*:null]const ?[*:0]const u8 {
+    return if (builtin.os.tag == .macos) @ptrCast(_NSGetEnviron().*) else @ptrCast(std.c.environ);
+}
+
 // posix_spawn family — declared directly via extern "c" so this builds on
 // both Darwin and Linux. (std.c.posix_spawnp is gated to .isDarwin() in 0.16
 // and would fail to compile on Linux even though glibc/musl provide it.)
@@ -790,10 +795,7 @@ fn runCapturePosix(opts: RunOptions) !CaptureResult {
     _ = posix_spawn_file_actions_addclose(fa, err_pipe[0]);
     _ = posix_spawn_file_actions_addclose(fa, err_pipe[1]);
 
-    const envp: [*:null]const ?[*:0]const u8 = if (builtin.os.tag == .macos)
-        @ptrCast(_NSGetEnviron().*)
-    else
-        @ptrCast(std.c.environ);
+    const envp = environ();
 
     var pid: pid_t = 0;
     if (posix_spawnp(&pid, c_argv[0].?, fa, null, c_argv_z, envp) != 0)
@@ -968,10 +970,7 @@ fn spawnDetachedPosix(allocator: std.mem.Allocator, argv: []const []const u8) vo
     _ = posix_spawn_file_actions_addopen(fa, 1, devnull, 2, 0);
     _ = posix_spawn_file_actions_addopen(fa, 2, devnull, 2, 0);
 
-    const envp: [*:null]const ?[*:0]const u8 = if (builtin.os.tag == .macos)
-        @ptrCast(_NSGetEnviron().*)
-    else
-        @ptrCast(std.c.environ);
+    const envp = environ();
 
     var pid: pid_t = 0;
     // Fire and forget: no waitpid. The child reparents to init once this CLI

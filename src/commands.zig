@@ -22,6 +22,7 @@ const index_mod = @import("index.zig");
 const Config = @import("config.zig").Config;
 const Out = @import("out.zig").Out;
 const cli_proxy = @import("cli_proxy.zig");
+const mcp_shared = @import("mcp_shared.zig");
 const cliDaemonListen = cli_proxy.cliDaemonListen;
 const cliSocketPath = cli_proxy.cliSocketPath;
 const bootstrap = @import("bootstrap.zig");
@@ -447,6 +448,48 @@ pub fn runServe(ctx: *RunCtx) !void {
 }
 
 pub fn runMcp(ctx: *RunCtx) !void {
+    try serveMcp(ctx, .stdio);
+}
+
+/// Hidden command that `codedb mcp` forwards to: one index for every client
+/// of its key, exiting after CODEDB_MCP_IDLE_MS without a client.
+pub fn runMcpServer(ctx: *RunCtx) !void {
+    const lock_fd = mcp_shared.inheritedLockFd(ctx.args[ctx.cmd_args_start..]);
+    var shared = mcp_shared.Server.bind(ctx.io, ctx.abs_root, ctx.cfg, ctx.no_telemetry, lock_fd, mcp_shared.idleMsFromEnv()) orelse return;
+    try serveMcp(ctx, .{ .shared = &shared });
+    // Detached workers (CLI proxy, warmup) may still read the index, so exit
+    // here instead of returning into mainImpl's deinit defers.
+    std.process.exit(0);
+}
+
+const McpTransport = union(enum) {
+    stdio,
+    shared: *mcp_shared.Server,
+};
+
+/// Clients of one shared server: they share the index, and each keeps its own
+/// MCP session state.
+const SharedSessions = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    store: *Store,
+    explorer: *Explorer,
+    agents: *AgentRegistry,
+    abs_root: []const u8,
+    max_cached: u32,
+    telem: *telemetry.Telemetry,
+    shutdown: *std.atomic.Value(bool),
+
+    pub fn runSession(self: *const SharedSessions, conn: c_int) void {
+        self.telem.recordSessionStart();
+        var broken = std.atomic.Value(bool).init(false);
+        const in: std.Io.File = .{ .handle = conn, .flags = .{ .nonblocking = false } };
+        const rpc: mcp_server.RpcOut = .{ .file = .{ .handle = conn }, .broken = &broken };
+        mcp_server.runPeer(self.io, self.allocator, in, rpc, self.store, self.explorer, self.agents, self.abs_root, self.max_cached, self.telem, null, self.shutdown);
+    }
+};
+
+fn serveMcp(ctx: *RunCtx, transport: McpTransport) !void {
     const io = ctx.io;
     const allocator = ctx.allocator;
     const abs_root = ctx.abs_root;
@@ -466,7 +509,8 @@ pub fn runMcp(ctx: *RunCtx) !void {
     defer agents.deinit();
     _ = try agents.register("__filesystem__");
 
-    const root_from_cwd = mcp_deferred_root;
+    const stdio = transport == .stdio;
+    const root_from_cwd = stdio and mcp_deferred_root;
 
     saveProjectInfo(io, allocator, data_dir, abs_root) catch {};
 
@@ -482,7 +526,7 @@ pub fn runMcp(ctx: *RunCtx) !void {
     var telem = telemetry.Telemetry.init(io, data_dir, allocator, telemetry_disabled);
     defer telem.deinit();
     telem.startSyncThread();
-    telem.recordSessionStart();
+    if (stdio) telem.recordSessionStart();
 
     var shutdown = std.atomic.Value(bool).init(false);
 
@@ -496,7 +540,7 @@ pub fn runMcp(ctx: *RunCtx) !void {
     var deferred: mcp_server.DeferredScan = undefined;
     var maybe_deferred: ?*mcp_server.DeferredScan = null;
 
-    const lazy_start = cio.posixGetenv("CODEDB_LAZY_MCP") != null;
+    const lazy_start = stdio and cio.posixGetenv("CODEDB_LAZY_MCP") != null;
     if (root_from_cwd or lazy_start) {
         deferred = .{
             .io = io,
@@ -538,7 +582,7 @@ pub fn runMcp(ctx: *RunCtx) !void {
         watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ io, store, explorer, queue, root, &shutdown, &scan_done, cfg.max_watched });
     }
 
-    const idle_thread = try std.Thread.spawn(.{}, idleWatchdog, .{&shutdown});
+    const idle_thread: ?std.Thread = if (stdio) try std.Thread.spawn(.{}, idleWatchdog, .{&shutdown}) else null;
 
     std.log.info("codedb mcp: root={s} files={d} data={s} scan={s}", .{ abs_root, store.currentSeq(), data_dir, mcp_server.getScanState().name() });
 
@@ -561,7 +605,25 @@ pub fn runMcp(ctx: *RunCtx) !void {
         }
         spawnWarmup(io, allocator, explorer, data_dir, abs_root, &shutdown);
     }
-    mcp_server.run(io, allocator, store, explorer, &agents, abs_root, cfg.max_cached, &telem, maybe_deferred, &shutdown);
+    switch (transport) {
+        .stdio => mcp_server.run(io, allocator, store, explorer, &agents, abs_root, cfg.max_cached, &telem, maybe_deferred, &shutdown),
+        .shared => |shared| {
+            const sessions = SharedSessions{
+                .io = io,
+                .allocator = allocator,
+                .store = store,
+                .explorer = explorer,
+                .agents = &agents,
+                .abs_root = abs_root,
+                .max_cached = cfg.max_cached,
+                .telem = &telem,
+                .shutdown = &shutdown,
+            };
+            // Fill the env-policy cache before sessions read it concurrently.
+            _ = mcp_server.mcpEmitRichBlocks(null);
+            shared.serve(&sessions);
+        },
+    }
 
     shutdown.store(true, .release);
     if (scan_thread) |st| st.join();
@@ -569,5 +631,5 @@ pub fn runMcp(ctx: *RunCtx) !void {
         if (d.scan_thread) |st| st.join();
     }
     watch_thread.join();
-    idle_thread.join();
+    if (idle_thread) |t| t.join();
 }

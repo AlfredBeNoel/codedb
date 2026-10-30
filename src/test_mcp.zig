@@ -33,6 +33,7 @@ const commands_mod = @import("commands.zig");
 const mcp_json = @import("mcp_json.zig");
 comptime {
     _ = @import("config.zig");
+    _ = @import("mcp_shared.zig");
 }
 
 fn setTestProjectRoot(explorer: *Explorer) !void {

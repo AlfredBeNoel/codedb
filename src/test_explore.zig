@@ -395,17 +395,17 @@ test "word index: index and search" {
 
     try wi.indexFile("src/foo.zig", "pub fn hello() void {\n    const x = 42;\n}\n");
 
-    const hits = wi.search("hello");
+    const hits = (try wi.search("hello", testing.allocator)).items;
     try testing.expect(hits.len > 0);
     try testing.expectEqualStrings("src/foo.zig", wi.hitPath(hits[0]));
     try testing.expect(hits[0].line_num == 1);
 
     // "x" is only 1 char, should be skipped
-    const x_hits = wi.search("x");
+    const x_hits = (try wi.search("x", testing.allocator)).items;
     try testing.expect(x_hits.len == 0);
 
     // "const" should be found
-    const const_hits = wi.search("const");
+    const const_hits = (try wi.search("const", testing.allocator)).items;
     try testing.expect(const_hits.len > 0);
     try testing.expect(const_hits[0].line_num == 2);
 }
@@ -415,11 +415,11 @@ test "word index: re-index clears old entries" {
     defer wi.deinit();
 
     try wi.indexFile("f.zig", "fn old_func() void {}");
-    try testing.expect(wi.search("old_func").len > 0);
+    try testing.expect((try wi.search("old_func", testing.allocator)).items.len > 0);
 
     try wi.indexFile("f.zig", "fn new_func() void {}");
-    try testing.expect(wi.search("old_func").len == 0);
-    try testing.expect(wi.search("new_func").len > 0);
+    try testing.expect((try wi.search("old_func", testing.allocator)).items.len == 0);
+    try testing.expect((try wi.search("new_func", testing.allocator)).items.len > 0);
 }
 
 test "word index: removeFile" {
@@ -427,10 +427,10 @@ test "word index: removeFile" {
     defer wi.deinit();
 
     try wi.indexFile("a.zig", "fn hello() void {}");
-    try testing.expect(wi.search("hello").len > 0);
+    try testing.expect((try wi.search("hello", testing.allocator)).items.len > 0);
 
     wi.removeFile("a.zig");
-    try testing.expect(wi.search("hello").len == 0);
+    try testing.expect((try wi.search("hello", testing.allocator)).items.len == 0);
 }
 
 test "word index: deduped search" {
@@ -880,11 +880,11 @@ test "word index: removeFile prunes empty buckets" {
 
     try wi.indexFile("a.zig", "uniqueWordOnlyHere anotherUnique");
     // Words should exist
-    try testing.expect(wi.search("uniqueWordOnlyHere").len > 0);
+    try testing.expect((try wi.search("uniqueWordOnlyHere", testing.allocator)).items.len > 0);
 
     wi.removeFile("a.zig");
     // After removal, buckets should be pruned (not just emptied)
-    try testing.expect(wi.search("uniqueWordOnlyHere").len == 0);
+    try testing.expect((try wi.search("uniqueWordOnlyHere", testing.allocator)).items.len == 0);
 }
 
 test "extractLines: basic range with line numbers" {
@@ -2318,8 +2318,8 @@ test "regular file retargeted to symlink stays unreadable after content release"
     try bootstrap_mod.persistWordIndexFromSource(io, &explorer, root, data_dir, null, testing.allocator);
     var loaded_words = WordIndex.readFromDisk(io, data_dir, testing.allocator) orelse return error.TestExpectedEqual;
     defer loaded_words.deinit();
-    try testing.expectEqual(@as(usize, 0), loaded_words.search("sensitive_swap_token").len);
-    try testing.expect(loaded_words.search("ordinarytoken").len > 0);
+    try testing.expectEqual(@as(usize, 0), (try loaded_words.search("sensitive_swap_token", testing.allocator)).items.len);
+    try testing.expect((try loaded_words.search("ordinarytoken", testing.allocator)).items.len > 0);
 }
 
 test "symlinked ignore files are not read as policy input" {
@@ -3193,9 +3193,9 @@ test "issue-594: failed re-index restores the word index from valid prior conten
         explorer.indexFile("src/a.zig", "pub fn alphaTok() void {}\n") catch unreachable;
         if (explorer.indexFile("src/a.zig", "pub fn betaTok() void {}\n")) |_| {
             // Tolerated failure — the new content must be live.
-            try testing.expect(explorer.word_index.search("betatok").len > 0);
+            try testing.expect((try explorer.word_index.search("betatok", testing.allocator)).items.len > 0);
         } else |_| {
-            if (explorer.word_index.search("alphatok").len == 0) return error.PriorContentLostOnFailedReindex;
+            if ((try explorer.word_index.search("alphatok", testing.allocator)).items.len == 0) return error.PriorContentLostOnFailedReindex;
         }
     }
 }

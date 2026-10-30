@@ -379,13 +379,14 @@ pub fn persistWordIndexToDisk(io: std.Io, explorer: *Explorer, data_dir: []const
     const generation = explorer.wordIndexGenerationToPersist() orelse return;
 
     explorer.mu.lockShared();
-    explorer.word_index.writeToDisk(io, data_dir, git_head) catch |err| {
+    const mapped = explorer.word_index.writeToDiskAndMap(io, data_dir, git_head) catch |err| {
         explorer.mu.unlockShared();
         std.log.warn("could not persist word index: {}", .{err});
         return;
     };
     explorer.mu.unlockShared();
     explorer.markWordIndexPersisted(generation);
+    if (mapped) |index| explorer.adoptPersistedWordIndex(generation, index);
 }
 
 pub fn wordIndexMatchesOutlines(explorer: *Explorer) bool {

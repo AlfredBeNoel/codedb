@@ -11,6 +11,21 @@ pub const WordHit = struct {
     line_num: u32,
 };
 
+fn hitLessThan(_: void, a: WordHit, b: WordHit) bool {
+    return a.doc_id < b.doc_id or (a.doc_id == b.doc_id and a.line_num < b.line_num);
+}
+
+/// Postings of one word: borrowed from the index, or merged into `owned` when
+/// an mmap index has edits. Release with deinit and the lookup's allocator.
+pub const Hits = struct {
+    items: []align(1) const WordHit = &.{},
+    owned: []WordHit = &.{},
+
+    pub fn deinit(self: Hits, allocator: std.mem.Allocator) void {
+        allocator.free(self.owned);
+    }
+};
+
 pub const WordIndex = struct {
     /// word → hits
     index: std.StringHashMap(std.ArrayList(WordHit)),
@@ -34,17 +49,21 @@ pub const WordIndex = struct {
     doc_lengths: std.AutoHashMap(u32, u32),
     /// Sum of all values in doc_lengths.
     total_tokens: u64 = 0,
-    /// Zero-copy read mode: when non-null, the postings live in this mmap'd
-    /// word.index file and `index` is empty — search/searchPrefix use a bounded
-    /// bbtree dictionary, with complete binary search as the low-memory fallback.
-    /// The first write promotes to a heap index (promoteIfBorrowed).
-    /// Cuts warm-daemon RSS from ~4x the file to a
-    /// small word directory + touched pages.
+    /// Zero-copy read mode: when non-null, the base postings live in this mmap'd
+    /// word.index file — search/searchPrefix use a bounded bbtree dictionary,
+    /// with complete binary search as the low-memory fallback. Writes never
+    /// copy the base: `index`/`file_words` hold only the edited files (the
+    /// delta) and `dead_base` masks base docs that were removed or re-indexed.
     mmap_data: ?[]align(std.heap.page_size_min) const u8 = null,
     /// Byte offset of each sorted word record in mmap_data, for binary search.
     word_dir: []u32 = &.{},
     /// Default mmap accelerator; at most 8 MiB, with unchanged disk/posting data.
     bb_dictionary: ?BBDictionary = null,
+    /// mmap mode: set by the first write, once path_to_id covers every base doc.
+    overlay_ready: bool = false,
+    /// mmap mode: base doc ids whose mmap postings are stale.
+    dead_base: std.DynamicBitSetUnmanaged = .{},
+    dead_base_count: u32 = 0,
 
     pub fn enableBBDictionary(self: *WordIndex) !void {
         if (self.bb_dictionary != null) return;
@@ -90,24 +109,7 @@ pub const WordIndex = struct {
 
     pub fn deinit(self: *WordIndex) void {
         if (self.bb_dictionary) |*dictionary| dictionary.deinit();
-        if (self.mmap_data) |m| {
-            // Zero-copy mode: index/path_to_id/file_words are empty; id_to_path
-            // owns the duped paths; word_dir + doc_lengths are heap; the postings
-            // live in the mmap. Free the heap bits and unmap.
-            self.index.deinit();
-            self.path_to_id.deinit();
-            self.file_words.deinit();
-            for (self.id_to_path.items) |path| {
-                if (path.len > 0) self.allocator.free(path);
-            }
-            self.id_to_path.deinit(self.allocator);
-            self.free_ids.deinit(self.allocator);
-            self.doc_lengths.deinit();
-            self.allocator.free(self.word_dir);
-            cio.munmap(m);
-            return;
-        }
-        // Free hit lists and duped word keys
+        // Free hit lists and duped word keys (only the delta in mmap mode).
         var iter = self.index.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -133,13 +135,155 @@ pub const WordIndex = struct {
         self.id_to_path.deinit(self.allocator);
         self.free_ids.deinit(self.allocator);
         self.doc_lengths.deinit();
+        self.dead_base.deinit(self.allocator);
+        if (self.mmap_data) |m| {
+            self.allocator.free(self.word_dir);
+            cio.munmap(m);
+        }
     }
+
+    /// First write to an mmap index: index every base path so the heap code
+    /// paths can find doc ids, and size the dead-doc mask to the base.
+    fn beginOverlay(self: *WordIndex) !void {
+        if (self.mmap_data == null or self.overlay_ready) return;
+        const base_docs = self.id_to_path.items.len;
+        var dead = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, base_docs);
+        errdefer dead.deinit(self.allocator);
+        try self.path_to_id.ensureTotalCapacity(@intCast(base_docs));
+        for (self.id_to_path.items, 0..) |p, i| {
+            if (p.len > 0) self.path_to_id.putAssumeCapacity(p, @intCast(i));
+        }
+        self.dead_base.deinit(self.allocator);
+        self.dead_base = dead;
+        self.overlay_ready = true;
+    }
+
+    fn markBaseDead(self: *WordIndex, doc_id: u32) void {
+        if (doc_id >= self.dead_base.bit_length or self.dead_base.isSet(doc_id)) return;
+        self.dead_base.set(doc_id);
+        self.dead_base_count += 1;
+    }
+
+    fn isDeadBase(self: *const WordIndex, doc_id: u32) bool {
+        return doc_id < self.dead_base.bit_length and self.dead_base.isSet(doc_id);
+    }
+
+    fn anyDeadBase(self: *const WordIndex, base: []align(1) const WordHit) bool {
+        if (self.dead_base_count == 0) return false;
+        for (base) |h| {
+            if (self.isDeadBase(h.doc_id)) return true;
+        }
+        return false;
+    }
+
+    fn hasLiveBase(self: *const WordIndex, base: []align(1) const WordHit) bool {
+        if (self.dead_base_count == 0) return base.len > 0;
+        for (base) |h| {
+            if (!self.isDeadBase(h.doc_id)) return true;
+        }
+        return false;
+    }
+
+    /// Merge live base hits and the delta into `buf` (len >= base.len + delta.len).
+    /// The delta is sorted in buf's tail first; the forward merge never overtakes it.
+    fn mergeLive(self: *const WordIndex, base: []align(1) const WordHit, delta: []const WordHit, buf: []WordHit) []WordHit {
+        const tail = buf[base.len..][0..delta.len];
+        @memcpy(tail, delta);
+        std.mem.sort(WordHit, tail, {}, hitLessThan);
+        var w: usize = 0;
+        var d: usize = 0;
+        for (base) |h| {
+            if (self.isDeadBase(h.doc_id)) continue;
+            while (d < tail.len and hitLessThan({}, tail[d], h)) : (d += 1) {
+                buf[w] = tail[d];
+                w += 1;
+            }
+            buf[w] = h;
+            w += 1;
+        }
+        while (d < tail.len) : (d += 1) {
+            buf[w] = tail[d];
+            w += 1;
+        }
+        return buf[0..w];
+    }
+
+    fn overlayHits(self: *const WordIndex, base: []align(1) const WordHit, delta: []const WordHit, allocator: std.mem.Allocator) !Hits {
+        if (delta.len == 0 and !self.anyDeadBase(base)) return .{ .items = base };
+        const buf = try allocator.alloc(WordHit, base.len + delta.len);
+        return .{ .items = self.mergeLive(base, delta, buf), .owned = buf };
+    }
+
+    fn baseWord(self: *const WordIndex, rank: usize) []const u8 {
+        const data = self.mmap_data.?;
+        const off = self.word_dir[rank];
+        const wlen = std.mem.readInt(u16, data[off..][0..2], .little);
+        return data[off + 2 ..][0..wlen];
+    }
+
+    fn basePosts(self: *const WordIndex, rank: usize) []align(1) const WordHit {
+        const data = self.mmap_data.?;
+        const off = self.word_dir[rank];
+        const wlen = std.mem.readInt(u16, data[off..][0..2], .little);
+        const hc_off = off + 2 + wlen;
+        const hit_count = std.mem.readInt(u32, data[hc_off..][0..4], .little);
+        return std.mem.bytesAsSlice(WordHit, data[hc_off + 4 ..][0 .. @as(usize, hit_count) * @sizeOf(WordHit)]);
+    }
+
+    /// Delta words that start with `prefix`, sorted like the on-disk words.
+    fn sortedDeltaWords(self: *const WordIndex, allocator: std.mem.Allocator, prefix: []const u8) ![]const []const u8 {
+        var words: std.ArrayList([]const u8) = .empty;
+        errdefer words.deinit(allocator);
+        var it = self.index.keyIterator();
+        while (it.next()) |k| {
+            if (std.mem.startsWith(u8, k.*, prefix)) try words.append(allocator, k.*);
+        }
+        std.mem.sort([]const u8, words.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lt);
+        return words.toOwnedSlice(allocator);
+    }
+
+    /// Walks base words from `base_pos` and sorted delta words as one sorted
+    /// sequence, pairing the two posting sources of a word present in both.
+    const OverlayWordIter = struct {
+        wi: *const WordIndex,
+        prefix: []const u8,
+        base_pos: usize,
+        delta: []const []const u8,
+        delta_pos: usize = 0,
+
+        const Entry = struct {
+            word: []const u8,
+            base: []align(1) const WordHit = &.{},
+            delta: []const WordHit = &.{},
+        };
+
+        fn next(it: *OverlayWordIter) ?Entry {
+            const has_base = it.base_pos < it.wi.word_dir.len and
+                std.mem.startsWith(u8, it.wi.baseWord(it.base_pos), it.prefix);
+            const has_delta = it.delta_pos < it.delta.len;
+            if (!has_base and !has_delta) return null;
+            const order: std.math.Order = if (!has_base) .gt else if (!has_delta) .lt else std.mem.order(u8, it.wi.baseWord(it.base_pos), it.delta[it.delta_pos]);
+            var entry: Entry = .{ .word = if (order == .gt) it.delta[it.delta_pos] else it.wi.baseWord(it.base_pos) };
+            if (order != .gt) {
+                entry.base = it.wi.basePosts(it.base_pos);
+                it.base_pos += 1;
+            }
+            if (order != .lt) {
+                entry.delta = it.wi.index.getPtr(it.delta[it.delta_pos]).?.items;
+                it.delta_pos += 1;
+            }
+            return entry;
+        }
+    };
 
     /// Remove all index entries for a file (call before re-indexing).
     pub fn removeFile(self: *WordIndex, path: []const u8) void {
-        if (self.mmap_data != null) {
-            // Zero-copy mode: postings live in the mmap and a remove is a
-            // write, so promote first — but only when the file is actually
+        if (self.mmap_data != null and !self.overlay_ready) {
+            // Zero-copy mode: start the overlay only when the file is actually
             // tracked (id_to_path is the only populated map in this mode).
             var tracked = false;
             for (self.id_to_path.items) |p| {
@@ -149,7 +293,7 @@ pub const WordIndex = struct {
                 }
             }
             if (!tracked) return;
-            self.promoteIfBorrowed() catch return;
+            self.beginOverlay() catch return;
         }
 
         if (self.file_words.fetchRemove(path)) |removed| {
@@ -162,6 +306,7 @@ pub const WordIndex = struct {
                 return;
             };
             _ = self.path_to_id.remove(stable_path);
+            self.markBaseDead(doc_id);
             if (doc_id < self.id_to_path.items.len) {
                 const old_path = self.id_to_path.items[doc_id];
                 // Bulk/mmap modes give id_to_path its own strings; otherwise the
@@ -210,6 +355,7 @@ pub const WordIndex = struct {
         // list, so this runs at most once per file.
         const doc_id = self.path_to_id.get(path) orelse return;
         _ = self.path_to_id.remove(path);
+        self.markBaseDead(doc_id);
         if (self.doc_lengths.fetchRemove(doc_id)) |kv| {
             self.total_tokens -= kv.value;
         }
@@ -286,8 +432,8 @@ pub const WordIndex = struct {
 
     pub fn indexFile(self: *WordIndex, path: []const u8, content: []const u8) !void {
         if (!self.enabled) return;
-        // A write to a zero-copy (mmap) index must first materialize a heap index.
-        try self.promoteIfBorrowed();
+        // A write to a zero-copy (mmap) index lands in the heap delta.
+        try self.beginOverlay();
         // Clean up old entries first; removeFile guarantees the path is no
         // longer tracked, so the stable copy is always a fresh dupe.
         self.removeFile(path);
@@ -447,15 +593,18 @@ pub const WordIndex = struct {
 
     /// Look up all hits for a word. O(1) lookup + O(hits) iteration.
     /// Query is normalized to lowercase (all index keys are stored lowercase).
-    pub fn search(self: *WordIndex, word: []const u8) []align(1) const WordHit {
+    pub fn search(self: *WordIndex, word: []const u8, allocator: std.mem.Allocator) !Hits {
         var buf: [512]u8 = undefined;
         const lower = if (word.len <= buf.len) blk: {
             for (word, 0..) |c, i| buf[i] = normalizeChar(c);
             break :blk buf[0..word.len];
         } else word;
-        if (self.mmap_data != null) return self.mmapSearch(lower);
-        if (self.index.get(lower)) |hits| return hits.items;
-        return &.{};
+        if (self.mmap_data != null) {
+            const delta: []const WordHit = if (self.index.getPtr(lower)) |list| list.items else &.{};
+            return self.overlayHits(self.mmapSearch(lower), delta, allocator);
+        }
+        if (self.index.get(lower)) |hits| return .{ .items = hits.items };
+        return .{};
     }
 
     /// Binary-search the sorted on-disk words; return the postings as a
@@ -492,59 +641,15 @@ pub const WordIndex = struct {
         return &.{};
     }
 
-    /// First write to a zero-copy (mmap) index rebuilds a heap index from the
-    /// mmap so the mutation has somewhere to land, then unmaps. Reads stay
-    /// zero-copy; only an actual edit pays this one-time cost.
-    fn promoteIfBorrowed(self: *WordIndex) !void {
-        const data = self.mmap_data orelse return;
-        var new_index = std.StringHashMap(std.ArrayList(WordHit)).init(self.allocator);
-        errdefer {
-            var it = new_index.iterator();
-            while (it.next()) |e| {
-                self.allocator.free(e.key_ptr.*);
-                e.value_ptr.deinit(self.allocator);
-            }
-            new_index.deinit();
-        }
-        try new_index.ensureTotalCapacity(@intCast(self.word_dir.len));
-        for (self.word_dir) |off| {
-            const wlen = std.mem.readInt(u16, data[off..][0..2], .little);
-            const word = try self.allocator.dupe(u8, data[off + 2 ..][0..wlen]);
-            errdefer self.allocator.free(word);
-            const hc_off = off + 2 + wlen;
-            const hit_count = std.mem.readInt(u32, data[hc_off..][0..4], .little);
-            const posts = std.mem.bytesAsSlice(WordHit, data[hc_off + 4 ..][0 .. @as(usize, hit_count) * @sizeOf(WordHit)]);
-            var list: std.ArrayList(WordHit) = .empty;
-            errdefer list.deinit(self.allocator);
-            try list.appendUnalignedSlice(self.allocator, posts);
-            try new_index.put(word, list);
-        }
-        var new_p2i = std.StringHashMap(u32).init(self.allocator);
-        errdefer new_p2i.deinit();
-        try new_p2i.ensureTotalCapacity(@intCast(self.id_to_path.items.len));
-        for (self.id_to_path.items, 0..) |p, i| {
-            if (p.len > 0) try new_p2i.put(p, @intCast(i));
-        }
-        // Commit: drop the (empty) mmap-mode maps + unmap, install heap maps.
-        self.index.deinit();
-        self.path_to_id.deinit();
-        if (self.bb_dictionary) |*dictionary| dictionary.deinit();
-        self.bb_dictionary = null;
-        self.allocator.free(self.word_dir);
-        cio.munmap(data);
-        self.index = new_index;
-        self.path_to_id = new_p2i;
-        self.word_dir = &.{};
-        self.mmap_data = null;
-    }
-
     /// Look up hits, returning results allocated by the caller and deduplicated
     /// by (doc_id, line_num). Valid posting lists are pair-sorted, so their only
     /// possible duplicates are adjacent and compact in one allocation without a
     /// hash table. Retain a hash fallback for malformed, legacy, or incrementally
     /// swap-removed lists whose ordering has been broken.
     pub fn searchDeduped(self: *WordIndex, word: []const u8, allocator: std.mem.Allocator) ![]const WordHit {
-        const hits = self.search(word);
+        const lookup = try self.search(word, allocator);
+        defer lookup.deinit(allocator);
+        const hits = lookup.items;
         var result = try allocator.alloc(WordHit, hits.len);
         errdefer allocator.free(result);
 
@@ -602,7 +707,7 @@ pub const WordIndex = struct {
 
         if (self.mmap_data) |data| {
             // Sorted on-disk words: binary-search the prefix lower bound, then
-            // walk forward while the word still starts with `prefix`.
+            // walk forward (merged with delta words) while words start with `prefix`.
             var lo: usize = 0;
             var hi: usize = if (self.bb_dictionary) |*dictionary| blk: {
                 lo = dictionary.lowerBound(prefix);
@@ -614,17 +719,14 @@ pub const WordIndex = struct {
                 const wlen = std.mem.readInt(u16, data[off..][0..2], .little);
                 if (std.mem.order(u8, data[off + 2 ..][0..wlen], prefix) == .lt) lo = mid + 1 else hi = mid;
             }
-            var wi = lo;
-            outer_mmap: while (wi < self.word_dir.len) : (wi += 1) {
-                const off = self.word_dir[wi];
-                const wlen = std.mem.readInt(u16, data[off..][0..2], .little);
-                const wbytes = data[off + 2 ..][0..wlen];
-                if (!std.mem.startsWith(u8, wbytes, prefix)) break; // past the prefix range
-                if (wlen <= prefix.len) continue; // strictly longer; exact is Tier 0
-                const hc_off = off + 2 + wlen;
-                const hit_count = std.mem.readInt(u32, data[hc_off..][0..4], .little);
-                const posts = std.mem.bytesAsSlice(WordHit, data[hc_off + 4 ..][0 .. @as(usize, hit_count) * @sizeOf(WordHit)]);
-                for (posts) |hit| {
+            const delta_words = try self.sortedDeltaWords(allocator, prefix);
+            defer allocator.free(delta_words);
+            var words = OverlayWordIter{ .wi = self, .prefix = prefix, .base_pos = lo, .delta = delta_words };
+            outer_mmap: while (words.next()) |entry| {
+                if (entry.word.len <= prefix.len) continue; // strictly longer; exact is Tier 0
+                const posts = try self.overlayHits(entry.base, entry.delta, allocator);
+                defer posts.deinit(allocator);
+                for (posts.items) |hit| {
                     const dk = DedupKey{ .doc_id = hit.doc_id, .line_num = hit.line_num };
                     const gop = try seen.getOrPut(dk);
                     if (!gop.found_existing) {
@@ -694,6 +796,16 @@ pub const WordIndex = struct {
     const DISK_FORMAT_VERSION: u16 = 3;
 
     pub fn writeToDisk(self: *WordIndex, io: std.Io, dir_path: []const u8, git_head: ?[40]u8) !void {
+        _ = try self.writeToDiskInner(io, dir_path, git_head, false);
+    }
+
+    /// writeToDisk, then mmap the written file through the still-open handle, so
+    /// the result matches these bytes even if another process replaces word.index.
+    pub fn writeToDiskAndMap(self: *WordIndex, io: std.Io, dir_path: []const u8, git_head: ?[40]u8) !?WordIndex {
+        return self.writeToDiskInner(io, dir_path, git_head, true);
+    }
+
+    fn writeToDiskInner(self: *WordIndex, io: std.Io, dir_path: []const u8, git_head: ?[40]u8, map_result: bool) !?WordIndex {
         var file_table: std.ArrayList([]const u8) = .empty;
         defer file_table.deinit(self.allocator);
         const doc_to_disk = try self.allocator.alloc(u32, self.id_to_path.items.len);
@@ -710,19 +822,22 @@ pub const WordIndex = struct {
             doc_to_disk[doc_idx] = id;
         }
 
+        // mmap mode merges base and delta words below instead.
         var words_sorted: std.ArrayList([]const u8) = .empty;
         defer words_sorted.deinit(self.allocator);
-        try words_sorted.ensureTotalCapacity(self.allocator, self.index.count());
-        var word_iter = self.index.keyIterator();
-        while (word_iter.next()) |word_ptr| {
-            if (word_ptr.*.len > std.math.maxInt(u16)) return error.NameTooLong;
-            words_sorted.appendAssumeCapacity(word_ptr.*);
-        }
-        std.mem.sort([]const u8, words_sorted.items, {}, struct {
-            fn lt(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.order(u8, a, b) == .lt;
+        if (self.mmap_data == null) {
+            try words_sorted.ensureTotalCapacity(self.allocator, self.index.count());
+            var word_iter = self.index.keyIterator();
+            while (word_iter.next()) |word_ptr| {
+                if (word_ptr.*.len > std.math.maxInt(u16)) return error.NameTooLong;
+                words_sorted.appendAssumeCapacity(word_ptr.*);
             }
-        }.lt);
+            std.mem.sort([]const u8, words_sorted.items, {}, struct {
+                fn lt(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.order(u8, a, b) == .lt;
+                }
+            }.lt);
+        }
 
         const rand_suffix = cio.randU64();
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}/word.index.{x}.tmp", .{ dir_path, rand_suffix });
@@ -730,7 +845,7 @@ pub const WordIndex = struct {
         const final_path = try std.fmt.allocPrint(self.allocator, "{s}/word.index", .{dir_path});
         defer self.allocator.free(final_path);
 
-        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .read = map_result });
         defer file.close(io);
 
         var file_buf: [256 * 1024]u8 = undefined;
@@ -753,40 +868,16 @@ pub const WordIndex = struct {
             try writer.interface.writeAll(path);
         }
 
-        var wc_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &wc_buf, @intCast(words_sorted.items.len), .little);
-        try writer.interface.writeAll(&wc_buf);
-
-        for (words_sorted.items) |word| {
-            const hits = self.index.get(word) orelse return error.InvalidData;
-            var wl_buf: [2]u8 = undefined;
-            std.mem.writeInt(u16, &wl_buf, @intCast(word.len), .little);
-            try writer.interface.writeAll(&wl_buf);
-            try writer.interface.writeAll(word);
-
-            var hc_buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &hc_buf, @intCast(hits.items.len), .little);
-            try writer.interface.writeAll(&hc_buf);
-            // doc_id → disk_id is a pure integer remap (path_to_id keeps
-            // paths unique, so every live doc has exactly one disk id).
-            // The old per-hit StringHashMap lookup wyhashed the full path
-            // string for every posting — the dominant CPU term of the whole
-            // persist on large repos (#475's 840ms). Hits are also batched
-            // into 4KB chunks instead of one 8-byte writeAll each.
-            var chunk: [4096]u8 = undefined;
-            var chunk_len: usize = 0;
-            for (hits.items) |hit| {
-                const file_id = doc_to_disk[hit.doc_id];
-                if (file_id == std.math.maxInt(u32)) return error.InvalidData;
-                std.mem.writeInt(u32, chunk[chunk_len..][0..4], file_id, .little);
-                std.mem.writeInt(u32, chunk[chunk_len + 4 ..][0..4], hit.line_num, .little);
-                chunk_len += 8;
-                if (chunk_len == chunk.len) {
-                    try writer.interface.writeAll(chunk[0..chunk_len]);
-                    chunk_len = 0;
-                }
+        if (self.mmap_data != null) {
+            try self.writeOverlayWords(&writer.interface, doc_to_disk);
+        } else {
+            var wc_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &wc_buf, @intCast(words_sorted.items.len), .little);
+            try writer.interface.writeAll(&wc_buf);
+            for (words_sorted.items) |word| {
+                const hits = self.index.get(word) orelse return error.InvalidData;
+                try writeWordRecord(&writer.interface, word, hits.items, doc_to_disk);
             }
-            if (chunk_len > 0) try writer.interface.writeAll(chunk[0..chunk_len]);
         }
 
         // v3 trailer: per-doc length table for BM25.
@@ -794,13 +885,10 @@ pub const WordIndex = struct {
         var dl_count_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &dl_count_buf, @intCast(file_table.items.len), .little);
         try writer.interface.writeAll(&dl_count_buf);
-        for (file_table.items) |path| {
-            const in_mem_id = self.path_to_id.get(path) orelse {
-                var z: [4]u8 = .{ 0, 0, 0, 0 };
-                try writer.interface.writeAll(&z);
-                continue;
-            };
-            const len = self.doc_lengths.get(in_mem_id) orelse 0;
+        // Doc ids, not path_to_id: an mmap index without edits has no path_to_id.
+        for (self.id_to_path.items, 0..) |path, doc_idx| {
+            if (path.len == 0) continue;
+            const len = self.doc_lengths.get(@intCast(doc_idx)) orelse 0;
             var lb: [4]u8 = undefined;
             std.mem.writeInt(u32, &lb, len, .little);
             try writer.interface.writeAll(&lb);
@@ -812,6 +900,78 @@ pub const WordIndex = struct {
         try writer.interface.flush();
 
         try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), final_path, io);
+        if (!map_result) return null;
+        var mapped = (mmapFromFile(io, file, self.allocator) catch return null) orelse return null;
+        mapped.enableBBDictionary() catch {};
+        return mapped;
+    }
+
+    fn writeWordRecord(w: *std.Io.Writer, word: []const u8, hits: []align(1) const WordHit, doc_to_disk: []const u32) !void {
+        var wl_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &wl_buf, @intCast(word.len), .little);
+        try w.writeAll(&wl_buf);
+        try w.writeAll(word);
+
+        var hc_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &hc_buf, @intCast(hits.len), .little);
+        try w.writeAll(&hc_buf);
+        // doc_id → disk_id is a pure integer remap (path_to_id keeps
+        // paths unique, so every live doc has exactly one disk id).
+        // The old per-hit StringHashMap lookup wyhashed the full path
+        // string for every posting — the dominant CPU term of the whole
+        // persist on large repos (#475's 840ms). Hits are also batched
+        // into 4KB chunks instead of one 8-byte writeAll each.
+        var chunk: [4096]u8 = undefined;
+        var chunk_len: usize = 0;
+        for (hits) |hit| {
+            if (hit.doc_id >= doc_to_disk.len) return error.InvalidData;
+            const file_id = doc_to_disk[hit.doc_id];
+            if (file_id == std.math.maxInt(u32)) return error.InvalidData;
+            std.mem.writeInt(u32, chunk[chunk_len..][0..4], file_id, .little);
+            std.mem.writeInt(u32, chunk[chunk_len + 4 ..][0..4], hit.line_num, .little);
+            chunk_len += 8;
+            if (chunk_len == chunk.len) {
+                try w.writeAll(chunk[0..chunk_len]);
+                chunk_len = 0;
+            }
+        }
+        if (chunk_len > 0) try w.writeAll(chunk[0..chunk_len]);
+    }
+
+    /// mmap mode: write the union of base and delta words with merged hits.
+    /// Words whose every hit is dead are dropped, as the heap index prunes them.
+    fn writeOverlayWords(self: *WordIndex, w: *std.Io.Writer, doc_to_disk: []const u32) !void {
+        const delta_words = try self.sortedDeltaWords(self.allocator, "");
+        defer self.allocator.free(delta_words);
+        var word_count: u32 = 0;
+        var counter = OverlayWordIter{ .wi = self, .prefix = "", .base_pos = 0, .delta = delta_words };
+        while (counter.next()) |entry| {
+            if (entry.word.len > std.math.maxInt(u16)) return error.NameTooLong;
+            if (entry.delta.len > 0 or self.hasLiveBase(entry.base)) word_count += 1;
+        }
+        var wc_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &wc_buf, word_count, .little);
+        try w.writeAll(&wc_buf);
+
+        // page_allocator: the scratch grows to the largest list, and freed large
+        // malloc blocks stay dirty on macOS.
+        var scratch: []WordHit = &.{};
+        defer std.heap.page_allocator.free(scratch);
+        var words = OverlayWordIter{ .wi = self, .prefix = "", .base_pos = 0, .delta = delta_words };
+        while (words.next()) |entry| {
+            if (entry.delta.len == 0 and !self.anyDeadBase(entry.base)) {
+                if (entry.base.len > 0) try writeWordRecord(w, entry.word, entry.base, doc_to_disk);
+                continue;
+            }
+            const need = entry.base.len + entry.delta.len;
+            if (scratch.len < need) {
+                std.heap.page_allocator.free(scratch);
+                scratch = &.{};
+                scratch = try std.heap.page_allocator.alloc(WordHit, need);
+            }
+            const merged = self.mergeLive(entry.base, entry.delta, scratch);
+            if (merged.len > 0) try writeWordRecord(w, entry.word, merged, doc_to_disk);
+        }
     }
 
     pub fn readFromDisk(io: std.Io, dir_path: []const u8, allocator: std.mem.Allocator) ?WordIndex {
@@ -959,6 +1119,10 @@ pub const WordIndex = struct {
 
         const file = std.Io.Dir.cwd().openFile(io, index_path, .{}) catch return null;
         defer file.close(io);
+        return mmapFromFile(io, file, allocator);
+    }
+
+    fn mmapFromFile(io: std.Io, file: std.Io.File, allocator: std.mem.Allocator) !?WordIndex {
         const size = file.length(io) catch return null;
         if (size < 51) return null;
         const data = cio.mmapReadonly(file.handle, size) catch return null;

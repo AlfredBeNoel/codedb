@@ -3118,6 +3118,24 @@ pub const Explorer = struct {
         self.word_index_persisted_generation = self.word_index_generation;
     }
 
+    /// Swap the in-memory word index for the mmap of the file just persisted
+    /// from it, so its postings leave the heap. Drops `mapped` if it is stale.
+    pub fn adoptPersistedWordIndex(self: *Explorer, generation: u64, mapped: WordIndex) void {
+        var index = mapped;
+        self.mu.lock();
+        defer self.mu.unlock();
+        // The disk compacts doc ids, so only a hole-free index keeps every id.
+        const same_doc_ids = index.id_to_path.items.len == self.word_index.id_to_path.items.len;
+        if (!self.word_index_complete or self.word_index_generation != generation or !same_doc_ids) {
+            index.deinit();
+            return;
+        }
+        index.skip_file_words = self.word_index.skip_file_words;
+        index.enabled = self.word_index.enabled;
+        self.word_index.deinit();
+        self.word_index = index;
+    }
+
     pub fn removeFile(self: *Explorer, path: []const u8) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -4531,7 +4549,9 @@ pub const Explorer = struct {
         // with more exact word hits so popular identifiers and skip-trigram
         // canonical files are not hidden behind low-signal posting entries.
         const t0_start = cio.nanoTimestamp();
-        const word_hits = self.word_index.search(query);
+        const word_lookup = try self.word_index.search(query, allocator);
+        defer word_lookup.deinit(allocator);
+        const word_hits = word_lookup.items;
         if (word_hits.len > 0) {
             const Tier0File = struct {
                 path: []const u8,
@@ -4963,7 +4983,9 @@ pub const Explorer = struct {
 
         var breakdown: SearchBreakdown = .{};
         const t0_start = cio.nanoTimestamp();
-        const word_hits = self.word_index.search(query);
+        const word_lookup = try self.word_index.search(query, allocator);
+        defer word_lookup.deinit(allocator);
+        const word_hits = word_lookup.items;
         if (word_hits.len == 0) return false;
 
         const Tier0File = struct {
@@ -6561,7 +6583,9 @@ pub const Explorer = struct {
         var term_iter = terms_set.keyIterator();
         while (term_iter.next()) |term_ptr| {
             const term = term_ptr.*;
-            const hits = self.word_index.search(term);
+            const term_lookup = try self.word_index.search(term, ta);
+            defer term_lookup.deinit(ta);
+            const hits = term_lookup.items;
             if (hits.len == 0) continue;
 
             // df: distinct doc_ids in this posting list. tf: count of (term,doc)
@@ -6915,7 +6939,8 @@ pub const Explorer = struct {
             const tok_gop = try seen_tokens.getOrPut(lower);
             if (tok_gop.found_existing) continue;
             token_serial += 1;
-            for (self.word_index.search(lower)) |h| {
+            const token_lookup = try self.word_index.search(lower, sa);
+            for (token_lookup.items) |h| {
                 const gop = try per_doc.getOrPut(h.doc_id);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = .{ .distinct = 1, .total = 1, .line = h.line_num, .last_token = token_serial };
@@ -6987,7 +7012,9 @@ pub const Explorer = struct {
         const gen = self.search_gen.load(.acquire);
         if (self.word_render_cache.render(word, false, gen, allocator, out)) return;
         const render_start = out.items.len;
-        const hits = self.word_index.search(word);
+        const lookup = try self.word_index.search(word, allocator);
+        defer lookup.deinit(allocator);
+        const hits = lookup.items;
         try out.ensureUnusedCapacity(allocator, 64 + hits.len * 48);
         const w = cio.listWriter(out, allocator);
         try w.print("{d} hits for '{s}':\n", .{ hits.len, word });

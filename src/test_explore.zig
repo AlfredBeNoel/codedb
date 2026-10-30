@@ -3524,7 +3524,7 @@ test "issue-725: call graph follows an exact Zig re-export chain" {
 
     // Ranking may build the fast approximate graph first; callpath must replace
     // it with strict import-aware resolution rather than reusing stale edges.
-    explorer_inst.buildCallCentrality(testing.allocator);
+    explorer_inst.buildCallCentrality();
 
     const imported = (try explorer_inst.findCallPath("main", "run", testing.allocator, 4)) orelse
         return error.TestExpectedEqual;

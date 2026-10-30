@@ -6092,7 +6092,7 @@ fn handleIndex(
             std.heap.c_allocator.destroy(trigram);
         }
         trigram.writeToDisk(io, data_dir, git_head) catch |err| break :blk err;
-        build_explorer.buildCallCentrality(alloc);
+        build_explorer.buildCallCentrality();
         snapshot_mod.writeSnapshotDual(io, &build_explorer, abs_path, snapshot_path, alloc) catch |err| break :blk err;
         break :blk null;
     };

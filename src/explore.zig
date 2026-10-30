@@ -5345,7 +5345,7 @@ pub const Explorer = struct {
             cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null and
             (self.call_graph != null or self.symbol_index.contains(query)))
         {
-            self.ensureCallGraph(allocator);
+            self.ensureCallGraph();
             const ga = gd_arena.allocator();
             var gd_terms = std.StringHashMap(void).init(ga);
             gd_terms.put(query, {}) catch {};
@@ -5871,11 +5871,11 @@ pub const Explorer = struct {
     /// so a later load can restore it instead of paying the lazy first-query build.
     /// ensureCallCentrality assumes the caller already holds a shared lock (it is
     /// normally reached from searchContentRanked); this wrapper takes that lock.
-    pub fn buildCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
+    pub fn buildCallCentrality(self: *Explorer) void {
         self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
-        self.ensureCallCentrality(allocator);
+        self.ensureCallCentrality();
     }
 
     fn appendCallGraphZigImportBinding(
@@ -6103,7 +6103,7 @@ pub const Explorer = struct {
     /// Build the resolved call graph once (idempotent, mutex-guarded). Must be
     /// called while holding at least a shared lock on `mu`. Retains edges for
     /// codedb_callpath and computes per-file centrality (PageRank by default).
-    fn ensureCallGraphMode(self: *Explorer, allocator: std.mem.Allocator, exact: bool) void {
+    fn ensureCallGraphMode(self: *Explorer, exact: bool) void {
         if (self.call_graph != null and (!exact or self.call_graph_exact)) return;
         // #564: never build (and cache) a graph from a deferred symbol index —
         // resolveCallees would see no definitions and the empty graph would be
@@ -6119,12 +6119,12 @@ pub const Explorer = struct {
             self.call_graph_exact = false;
         }
 
-        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        // Edits rebuild this graph, so keep only function bodies and each file's
+        // bytes only while it is parsed. Page-backed: malloc keeps large freed blocks dirty.
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        // Edits rebuild this graph, so keep only function bodies and each file's
-        // bytes only while it is parsed: the peak is the bodies, not the corpus.
-        var file_arena = std.heap.ArenaAllocator.init(self.allocator);
+        var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer file_arena.deinit();
 
         var node_path: std.ArrayList([]const u8) = .empty;
@@ -6365,19 +6365,19 @@ pub const Explorer = struct {
         self.bumpSearchGen();
     }
 
-    fn ensureCallGraph(self: *Explorer, allocator: std.mem.Allocator) void {
-        self.ensureCallGraphMode(allocator, false);
+    fn ensureCallGraph(self: *Explorer) void {
+        self.ensureCallGraphMode(false);
     }
 
-    fn ensureExactCallGraph(self: *Explorer, allocator: std.mem.Allocator) void {
-        self.ensureCallGraphMode(allocator, true);
+    fn ensureExactCallGraph(self: *Explorer) void {
+        self.ensureCallGraphMode(true);
     }
 
     /// Build `call_centrality` once (idempotent, mutex-guarded). Must be called
     /// while holding at least a shared lock on `mu`.
-    fn ensureCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
+    fn ensureCallCentrality(self: *Explorer) void {
         if (self.call_centrality != null) return;
-        self.ensureCallGraph(allocator);
+        self.ensureCallGraph();
     }
 
     /// Shortest resolved call chain between two symbol names. Returns owned steps
@@ -6406,7 +6406,7 @@ pub const Explorer = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
-        self.ensureExactCallGraph(allocator);
+        self.ensureExactCallGraph();
         const cg = self.call_graph orelse return try allocator.alloc(CallPathStep, 0);
 
         var candidates: std.ArrayList(CallPathStep) = .empty;
@@ -6442,7 +6442,7 @@ pub const Explorer = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
-        self.ensureExactCallGraph(allocator);
+        self.ensureExactCallGraph();
         const cg = self.call_graph orelse return null;
 
         var from_ids: std.ArrayList(codegraph.NodeId) = .empty;
@@ -6555,7 +6555,7 @@ pub const Explorer = struct {
         // once and fold it in as an additive boost. On by default (MRR-validated
         // on the codedb set: 0.819 -> 0.944, +4 P@1, no recall loss); set
         // CODEDB_NO_CENTRALITY to disable.
-        if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null) self.ensureCallCentrality(allocator);
+        if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null) self.ensureCallCentrality();
 
         // Tokenize the query the same way WordIndex tokenizes documents:
         // lowercase + identifier-split. Dedupe terms so repeated query words
@@ -6608,7 +6608,7 @@ pub const Explorer = struct {
                 var gate_tok = idx.WordTokenizer{ .buf = query };
                 while (gate_tok.next()) |w| {
                     if (self.symbol_index.contains(w)) {
-                        self.ensureCallGraph(allocator);
+                        self.ensureCallGraph();
                         break;
                     }
                 }

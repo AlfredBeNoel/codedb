@@ -341,7 +341,7 @@ test "snapshot: call-graph centrality persists and restores (no lazy rebuild)" {
         \\
     );
 
-    exp.buildCallCentrality(testing.allocator);
+    exp.buildCallCentrality();
     try testing.expect(exp.call_centrality != null);
     const want = exp.call_centrality.?.get("cc_pkg/util.zig") orelse 0.0;
     try testing.expect(want > 0.0);

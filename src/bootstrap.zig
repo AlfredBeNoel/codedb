@@ -692,7 +692,7 @@ pub fn coldLoadOrScan(
             // first-query rebuild. Same env gate as the search path.
             if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null) {
                 const t_centrality: i128 = if (index_profile) cio.nanoTimestamp() else 0;
-                explorer.buildCallCentrality(allocator);
+                explorer.buildCallCentrality();
                 if (index_profile) profile_centrality_ns = cio.nanoTimestamp() - t_centrality;
             }
             // `main` writes the root + cache copies atomically for reindex.

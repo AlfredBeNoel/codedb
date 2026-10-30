@@ -539,7 +539,7 @@ Sharing applies to roots that are known at launch: a positional root,
 | Variable | Default | Effect |
 |---|---|---|
 | `CODEDB_MCP_SHARED` | on | `0` serves every session in-process. |
-| `CODEDB_MCP_SOCKET_DIR` | `~/.codedb/run` | Directory (mode 0700) for `<key>.sock`, `<key>.lock` and the server log `<key>.log`. The socket path must fit in 104 bytes. |
+| `CODEDB_MCP_SOCKET_DIR` | `~/.codedb/run` | Directory for `<key>.sock`, `<key>.lock` and the server log `<key>.log`. It must be a real directory that you own and that group and others cannot write (codedb creates it 0700). The socket path must fit in 104 bytes. |
 | `CODEDB_MCP_IDLE_MS` | `300000` | Time without a client before the server exits. |
 
 Look at `~/.codedb/run/<key>.log` when a server misbehaves. `pkill -f

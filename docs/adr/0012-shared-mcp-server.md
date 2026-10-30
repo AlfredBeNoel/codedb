@@ -38,6 +38,13 @@ It connects to `codedb <root> mcp-server` over a Unix socket in
    server releases the lock when its listener closes, so a later client can
    start the next server at once.
 
+7. Trust. The socket directory must be a real directory that the user owns
+   and that group and others cannot write. The lock and log open with
+   `O_NOFOLLOW`, the socket is 0600, and both ends check the peer uid.
+8. One index per root, also for explicit calls. A `project` argument that
+   names the server's own root uses the shared index, not a per-session
+   snapshot copy.
+
 Concurrent sessions exposed one shared-state cost: `Explorer.rebuildWordIndex`
 had no single-flight guard, so N sessions that missed the word index each read
 every file and built a full copy. A build mutex with a re-check of

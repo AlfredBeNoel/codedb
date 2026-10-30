@@ -6055,6 +6055,10 @@ pub const Explorer = struct {
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const a = arena_state.allocator();
+        // Edits rebuild this graph, so keep only function bodies and each file's
+        // bytes only while it is parsed: the peak is the bodies, not the corpus.
+        var file_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer file_arena.deinit();
 
         var node_path: std.ArrayList([]const u8) = .empty;
         var node_name: std.ArrayList([]const u8) = .empty;
@@ -6065,9 +6069,14 @@ pub const Explorer = struct {
 
         var it = self.outlines.iterator();
         while (it.next()) |entry| {
+            const has_functions = for (entry.value_ptr.symbols.items) |sym| {
+                if (sym.kind == .function or sym.kind == .method) break true;
+            } else false;
+            if (!has_functions) continue;
+            _ = file_arena.reset(.retain_capacity);
+            const fa = file_arena.allocator();
             const path = entry.key_ptr.*;
-            const ref = self.readContentForSearch(path, a) orelse continue;
-            defer ref.deinit();
+            const ref = self.readContentForSearch(path, fa) orelse continue;
             const content = ref.data;
             const direct_import_bindings = if (exact)
                 self.callGraphZigImportBindings(entry.value_ptr, content, a) catch &.{}
@@ -6077,9 +6086,9 @@ pub const Explorer = struct {
             import_bindings.appendSlice(a, direct_import_bindings) catch return;
             const file_func_start = funcs.items.len;
             var offs: std.ArrayList(usize) = .empty;
-            offs.append(a, 0) catch continue;
+            offs.append(fa, 0) catch continue;
             for (content, 0..) |ch, i| {
-                if (ch == '\n') offs.append(a, i + 1) catch break;
+                if (ch == '\n') offs.append(fa, i + 1) catch break;
             }
             const nlines = offs.items.len;
             for (entry.value_ptr.symbols.items) |sym| {
@@ -6089,7 +6098,7 @@ pub const Explorer = struct {
                 const end_line = @min(sym.line_end, nlines);
                 const end = if (end_line < nlines) offs.items[end_line] else content.len;
                 if (end <= start) continue;
-                const body = content[start..end];
+                const body = a.dupe(u8, content[start..end]) catch return;
                 const is_zig = exact and entry.value_ptr.language == .zig;
                 const has_thread_spawn = is_zig and std.mem.indexOf(u8, body, "std.Thread.spawn") != null;
                 const id: codegraph.NodeId = @intCast(node_path.items.len);

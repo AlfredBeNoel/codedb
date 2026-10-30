@@ -3299,6 +3299,36 @@ test "issue-656: call graph is stale and dangling after a file edit" {
     try testing.expect(after != null);
 }
 
+test "call paths resolve from disk after contents are released" {
+    var project = testing.tmpDir(.{});
+    defer project.cleanup();
+    // Every hop lives in its own file, so each body must outlive later reads.
+    const files = [_][2][]const u8{
+        .{ "chain_a.zig", "pub fn alpha() void {\n    beta();\n}\n" },
+        .{ "chain_b.zig", "pub fn beta() void {\n    // second hop\n    gamma();\n}\n" },
+        .{ "chain_c.zig", "pub fn gamma() void {\n    // third hop, longer comment\n    delta();\n}\n" },
+        .{ "chain_d.zig", "pub fn delta() void {\n    // last hop\n    epsilon();\n}\n" },
+        .{ "chain_e.zig", "pub fn epsilon() void {}\n" },
+        .{ "data.json", "{\"alpha\": 1}\n" },
+    };
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    for (files) |f| try project.dir.writeFile(io, .{ .sub_path = f[0], .data = f[1] });
+    const root = root_buf[0..try project.dir.realPathFile(io, ".", &root_buf)];
+
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.setRoot(io, root);
+    for (files) |f| try explorer_inst.indexFile(f[0], f[1]);
+    explorer_inst.releaseContents();
+
+    const path = (try explorer_inst.findCallPath("alpha", "epsilon", testing.allocator, 5)) orelse
+        return error.TestExpectedEqual;
+    defer testing.allocator.free(path);
+    const expected = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon" };
+    try testing.expectEqual(expected.len, path.len);
+    for (expected, path) |name, step| try testing.expectEqualStrings(name, step.name);
+}
+
 test "Swift multiline bodies and initializers participate in call paths" {
     var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer_inst.deinit();

@@ -1,0 +1,5 @@
+0001-explore-watcher-bound-memory-growth-in-long-sessions.patch
+0002-index-explore-cut-the-resident-footprint-of-the-word.patch
+0003-mcp-share-one-MCP-server-per-project-root.patch
+0004-explore-keep-the-call-graph-safe-under-concurrent-se.patch
+0005-update-make-the-background-auto-update-opt-in-with-C.patch

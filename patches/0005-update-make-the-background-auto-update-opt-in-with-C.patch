@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alfred Ben <e0958604@u.nus.edu>
+Date: Fri, 30 Oct 2026 17:24:01 +0800
+Subject: [PATCH 5/5] update: make the background auto-update opt-in with
+ CODEDB_AUTO_UPDATE=1
+
+The auto-update pipes the public install.sh into bash, which installs the
+upstream release over whatever binary runs, including a fork build.
+It now runs only when CODEDB_AUTO_UPDATE=1; CODEDB_NO_AUTO_UPDATE still
+turns it off. Without opt-in, codedb mcp touches no stamp file. The
+manual codedb update command is unchanged.
+---
+ README.md        |  4 +++-
+ src/commands.zig |  6 +++---
+ src/test_mcp.zig | 33 ++++++++++++++++++++++-----------
+ src/update.zig   | 23 ++++++++++++++++-------
+ 4 files changed, 44 insertions(+), 22 deletions(-)
+
+diff --git a/README.md b/README.md
+index f463d84..0202e48 100644
+--- a/README.md
++++ b/README.md
+@@ -290,7 +290,9 @@ backed by api.wiki.codes was removed; DeepWiki replaces that role.)
+ 
+ **Options:** `--no-telemetry` (or set `CODEDB_NO_TELEMETRY` env var)
+ 
+-**Claude Code hook opt-out:** the installer registers a PreToolUse hook that nudges agents from `grep`/`cat` to codedb inside indexed repos. `CODEDB_NO_HOOKS=1` skips it for that run only (it is never persisted from the environment, so a transient export can't be promoted to a permanent opt-out by the background auto-updater). To make it permanent, run the installer with `CODEDB_PERSIST_NO_HOOKS=1` or `touch ~/.codedb/no-hooks`; `rm ~/.codedb/no-hooks` re-enables it. Deleting the hook entry from `~/.claude/settings.json` is also permanent — the installer records its registrations and treats a missing entry as a deliberate removal (it writes `~/.codedb/no-hooks` for you, so `rm` that file to undo).
++**Auto-update:** off by default. With `CODEDB_AUTO_UPDATE=1`, `codedb mcp` runs the public installer in the background at most once every 24 hours; `CODEDB_NO_AUTO_UPDATE` turns it off even then. `codedb update` always works on demand.
++
++**Claude Code hook opt-out:** the installer registers a PreToolUse hook that nudges agents from `grep`/`cat` to codedb inside indexed repos. `CODEDB_NO_HOOKS=1` skips it for that run only (it is never persisted from the environment, so a transient export can't be promoted to a permanent opt-out by the opt-in background auto-updater). To make it permanent, run the installer with `CODEDB_PERSIST_NO_HOOKS=1` or `touch ~/.codedb/no-hooks`; `rm ~/.codedb/no-hooks` re-enables it. Deleting the hook entry from `~/.claude/settings.json` is also permanent — the installer records its registrations and treats a missing entry as a deliberate removal (it writes `~/.codedb/no-hooks` for you, so `rm` that file to undo).
+ 
+ ### Example: agent explores a codebase
+ 
+diff --git a/src/commands.zig b/src/commands.zig
+index 77a8995..e8f72ac 100644
+--- a/src/commands.zig
++++ b/src/commands.zig
+@@ -503,9 +503,9 @@ fn serveMcp(ctx: *RunCtx, transport: McpTransport) !void {
+     const cfg = ctx.cfg;
+     const no_telemetry = ctx.no_telemetry;
+     const mcp_deferred_root = ctx.mcp_deferred_root;
+-    // Background auto-update check (no-op when CODEDB_NO_AUTO_UPDATE is set
+-    // or when the last check was within the last 24h). Detached thread, so
+-    // this doesn't block server startup.
++    // Background auto-update check (no-op unless CODEDB_AUTO_UPDATE=1, or when
++    // the last check was within the last 24h). Detached thread, so this
++    // doesn't block server startup.
+     update_mod.maybeAutoUpdate(io, allocator);
+ 
+     var agents = AgentRegistry.init(allocator);
+diff --git a/src/test_mcp.zig b/src/test_mcp.zig
+index c62bf61..5194ad9 100644
+--- a/src/test_mcp.zig
++++ b/src/test_mcp.zig
+@@ -429,22 +429,33 @@ test "issue-624: convergence governor flags a repeated identical call" {
+ test "auto-update: shouldRunAutoUpdate gates correctly" {
+     const day_ms: i64 = 24 * 60 * 60 * 1000;
+ 
+-    // Disabled by env: never runs
+-    try testing.expect(!update_mod.shouldRunAutoUpdate(0, null, true));
+-    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms * 100, null, true));
+-    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms * 100, 0, true));
++    // Not opted in: never runs
++    try testing.expect(!update_mod.shouldRunAutoUpdate(0, null, false));
++    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms * 100, null, false));
++    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms * 100, 0, false));
+ 
+-    // First run (no stamp): always runs when not disabled
+-    try testing.expect(update_mod.shouldRunAutoUpdate(0, null, false));
++    // First run (no stamp): always runs when opted in
++    try testing.expect(update_mod.shouldRunAutoUpdate(0, null, true));
+ 
+     // Throttled: <24h since last check → skip
+-    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms - 1, 0, false));
++    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms - 1, 0, true));
+ 
+     // Exactly 24h since last check → run
+-    try testing.expect(update_mod.shouldRunAutoUpdate(day_ms, 0, false));
++    try testing.expect(update_mod.shouldRunAutoUpdate(day_ms, 0, true));
+ 
+     // Long after last check → run
+-    try testing.expect(update_mod.shouldRunAutoUpdate(day_ms * 7, 0, false));
++    try testing.expect(update_mod.shouldRunAutoUpdate(day_ms * 7, 0, true));
++}
++
++test "auto-update: off unless CODEDB_AUTO_UPDATE=1, and CODEDB_NO_AUTO_UPDATE wins" {
++    try testing.expect(!update_mod.autoUpdateOptedIn(null, null));
++    try testing.expect(update_mod.autoUpdateOptedIn("1", null));
++    try testing.expect(!update_mod.autoUpdateOptedIn("0", null));
++    try testing.expect(!update_mod.autoUpdateOptedIn("", null));
++    try testing.expect(!update_mod.autoUpdateOptedIn("true", null));
++    try testing.expect(!update_mod.autoUpdateOptedIn("1", "1"));
++    try testing.expect(!update_mod.autoUpdateOptedIn("1", ""));
++    try testing.expect(!update_mod.autoUpdateOptedIn(null, "1"));
+ }
+ 
+ test "issue-394: shouldRunAutoUpdate permanently blocked by future-timestamp stamp file" {
+@@ -464,7 +475,7 @@ test "issue-394: shouldRunAutoUpdate permanently blocked by future-timestamp sta
+     const now_ms: i64 = 1_700_000_000_000;
+     const future_last_ms: i64 = now_ms + day_ms * 30; // 30 days in the future
+ 
+-    try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, future_last_ms, false));
++    try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, future_last_ms, true));
+ }
+ 
+ test "issue-395: shouldRunAutoUpdate panics on i64 underflow when stamp is corrupt" {
+@@ -489,7 +500,7 @@ test "issue-395: shouldRunAutoUpdate panics on i64 underflow when stamp is corru
+     const now_ms: i64 = 1_700_000_000_000;
+     const last_ms: i64 = std.math.minInt(i64);
+ 
+-    try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, last_ms, false));
++    try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, last_ms, true));
+ }
+ 
+ test "issue-150: --help prints usage" {
+diff --git a/src/update.zig b/src/update.zig
+index 4b22774..b587619 100644
+--- a/src/update.zig
++++ b/src/update.zig
+@@ -357,9 +357,9 @@ fn sha256FileHex(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]
+ 
+ // ── Auto-update ──────────────────────────────────────────────────────────────
+ //
+-// On startup we kick off a detached check that shells out to the public
+-// install.sh. The check is:
+-//   • disabled when CODEDB_NO_AUTO_UPDATE is set in the environment
++// When opted in, MCP startup kicks off a detached check that shells out to the
++// public install.sh. The check is:
++//   • off unless CODEDB_AUTO_UPDATE=1; CODEDB_NO_AUTO_UPDATE turns it off either way
+ //   • throttled to at most once every 24 hours, tracked in
+ //     ~/.codedb/last_auto_update_check (a u64 little-endian unix-ms timestamp)
+ // The update itself runs in a background thread so it never blocks server
+@@ -371,10 +371,18 @@ const auto_update_install_url = "https://codedb.codegraff.com/install.sh";
+ const auto_update_throttle_ms: i64 = 24 * 60 * 60 * 1000;
+ const auto_update_stamp_filename = "last_auto_update_check";
+ 
++/// Off by default: install.sh installs the upstream release, which would
++/// replace a fork build. CODEDB_NO_AUTO_UPDATE wins over CODEDB_AUTO_UPDATE.
++pub fn autoUpdateOptedIn(auto_update: ?[]const u8, no_auto_update: ?[]const u8) bool {
++    if (no_auto_update != null) return false;
++    const value = auto_update orelse return false;
++    return std.mem.eql(u8, value, "1");
++}
++
+ /// Pure decision function — useful for tests. Returns true when the next
+ /// auto-update attempt should fire.
+-pub fn shouldRunAutoUpdate(now_ms: i64, last_check_ms: ?i64, env_disabled: bool) bool {
+-    if (env_disabled) return false;
++pub fn shouldRunAutoUpdate(now_ms: i64, last_check_ms: ?i64, opted_in: bool) bool {
++    if (!opted_in) return false;
+     const last = last_check_ms orelse return true;
+     if (last > now_ms) return true;
+     const delta: i128 = @as(i128, now_ms) - @as(i128, last);
+@@ -382,7 +390,8 @@ pub fn shouldRunAutoUpdate(now_ms: i64, last_check_ms: ?i64, env_disabled: bool)
+ }
+ 
+ pub fn maybeAutoUpdate(io: std.Io, allocator: std.mem.Allocator) void {
+-    const env_disabled = cio.posixGetenv("CODEDB_NO_AUTO_UPDATE") != null;
++    const opted_in = autoUpdateOptedIn(cio.posixGetenv("CODEDB_AUTO_UPDATE"), cio.posixGetenv("CODEDB_NO_AUTO_UPDATE"));
++    if (!opted_in) return;
+     const home = cio.homeDir() orelse return;
+     if (home.len == 0) return;
+ 
+@@ -395,7 +404,7 @@ pub fn maybeAutoUpdate(io: std.Io, allocator: std.mem.Allocator) void {
+ 
+     const last_ms = readAutoUpdateStamp(io, stamp_path);
+     const now_ms = cio.milliTimestamp();
+-    if (!shouldRunAutoUpdate(now_ms, last_ms, env_disabled)) return;
++    if (!shouldRunAutoUpdate(now_ms, last_ms, opted_in)) return;
+ 
+     // Persist the new timestamp before launching so concurrent invocations
+     // don't all race the same check.

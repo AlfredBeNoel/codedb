@@ -1,0 +1,369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alfred Ben <e0958604@u.nus.edu>
+Date: Fri, 30 Oct 2026 17:24:01 +0800
+Subject: [PATCH 4/5] explore: keep the call graph safe under concurrent
+ sessions
+
+Follow-ups to the combined growth, footprint and shared-server changes.
+
+- back both call-graph arenas with page_allocator, so the warm footprint
+  does not regress; the call-graph helpers no longer take an allocator
+- retire the approximate call graph on an exact upgrade instead of
+  freeing it under a shared lock while other sessions read it
+- publish and read the call graph and call centrality under one lock;
+  callpath uses only an exact graph
+---
+ src/bootstrap.zig     |   2 +-
+ src/explore.zig       | 112 ++++++++++++++++++++++++++----------------
+ src/mcp.zig           |   2 +-
+ src/snapshot.zig      |   5 +-
+ src/test_explore.zig  |  26 +++++++++-
+ src/test_snapshot.zig |   2 +-
+ 6 files changed, 100 insertions(+), 49 deletions(-)
+
+diff --git a/src/bootstrap.zig b/src/bootstrap.zig
+index 56958b0..2443467 100644
+--- a/src/bootstrap.zig
++++ b/src/bootstrap.zig
+@@ -692,7 +692,7 @@ pub fn coldLoadOrScan(
+             // first-query rebuild. Same env gate as the search path.
+             if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null) {
+                 const t_centrality: i128 = if (index_profile) cio.nanoTimestamp() else 0;
+-                explorer.buildCallCentrality(allocator);
++                explorer.buildCallCentrality();
+                 if (index_profile) profile_centrality_ns = cio.nanoTimestamp() - t_centrality;
+             }
+             // `main` writes the root + cache copies atomically for reindex.
+diff --git a/src/explore.zig b/src/explore.zig
+index 449adba..3406381 100644
+--- a/src/explore.zig
++++ b/src/explore.zig
+@@ -1851,6 +1851,12 @@ pub const Explorer = struct {
+     /// Ranking uses the historical fast approximate graph. User-visible
+     /// callpaths upgrade it in place to strict scoped/import-aware resolution.
+     call_graph_exact: bool = false,
++    /// Graphs an exact upgrade replaced under a shared `mu`; readers may still
++    /// hold them, so only an exclusive `mu` frees them.
++    retired_call_graphs: std.ArrayList(CallGraph) = .empty,
++    /// Builds publish `call_graph`, `call_graph_exact` and `call_centrality` under
++    /// a shared `mu`; readers copy them under this lock.
++    call_graph_publish_mu: cio.Mutex = .{},
+     centrality_build_mu: cio.Mutex = .{},
+     root_dir: ?std.Io.Dir = null,
+     /// Absolute project root path (duped in setRoot) — needed to shell out to
+@@ -2068,8 +2074,8 @@ pub const Explorer = struct {
+         self.outline_render_cache.deinit();
+         self.fuzzy_file_cache.deinit();
+         self.word_render_cache.deinit();
+-        if (self.call_centrality) |*c| c.deinit();
+-        if (self.call_graph) |*cg| cg.deinit(self.allocator);
++        self.dropCallGraphLocked();
++        self.retired_call_graphs.deinit(self.allocator);
+         if (self.co_change) |*cc| git.freeCoChange(cc, self.allocator);
+         if (self.root_path) |p| self.allocator.free(p);
+ 
+@@ -3118,6 +3124,8 @@ pub const Explorer = struct {
+             self.call_graph = null;
+             self.call_graph_exact = false;
+         }
++        for (self.retired_call_graphs.items) |*cg| cg.deinit(self.allocator);
++        self.retired_call_graphs.clearRetainingCapacity();
+         if (self.call_centrality) |*cc| {
+             cc.deinit();
+             self.call_centrality = null;
+@@ -5343,9 +5351,9 @@ pub const Explorer = struct {
+         var graph_dist: ?std.StringHashMap(u8) = null;
+         if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
+             cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null and
+-            (self.call_graph != null or self.symbol_index.contains(query)))
++            (self.publishedCallGraph(false) != null or self.symbol_index.contains(query)))
+         {
+-            self.ensureCallGraph(allocator);
++            self.ensureCallGraph();
+             const ga = gd_arena.allocator();
+             var gd_terms = std.StringHashMap(void).init(ga);
+             gd_terms.put(query, {}) catch {};
+@@ -5728,7 +5736,7 @@ pub const Explorer = struct {
+     /// multiplier ≥ 1, never a filter, so a misresolved edge can only nudge a
+     /// central file up, never drop a real result. alpha tuned via MRR.
+     fn centralityBoost(self: *Explorer, path: []const u8) f32 {
+-        const cm = self.call_centrality orelse return 1.0;
++        const cm = self.publishedCentrality() orelse return 1.0;
+         const c = cm.get(path) orelse return 1.0;
+         const alpha: f32 = 0.15;
+         return 1.0 + alpha * @log(1.0 + c);
+@@ -5739,7 +5747,7 @@ pub const Explorer = struct {
+     /// each reached file's minimum hop distance. Arena-allocated; null when no
+     /// graph is built or no term names a symbol, so ranking is unchanged.
+     fn queryGraphDistances(self: *Explorer, terms: *const std.StringHashMap(void), ta: std.mem.Allocator) ?std.StringHashMap(u8) {
+-        const cg = self.call_graph orelse return null;
++        const cg = self.publishedCallGraph(false) orelse return null;
+         const n = cg.node_name.len;
+         if (n == 0) return null;
+         const max_hops: u8 = 3;
+@@ -5871,11 +5879,11 @@ pub const Explorer = struct {
+     /// so a later load can restore it instead of paying the lazy first-query build.
+     /// ensureCallCentrality assumes the caller already holds a shared lock (it is
+     /// normally reached from searchContentRanked); this wrapper takes that lock.
+-    pub fn buildCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
++    pub fn buildCallCentrality(self: *Explorer) void {
+         self.ensureSymbolIndex();
+         self.mu.lockShared();
+         defer self.mu.unlockShared();
+-        self.ensureCallCentrality(allocator);
++        self.ensureCallCentrality();
+     }
+ 
+     fn appendCallGraphZigImportBinding(
+@@ -6103,8 +6111,8 @@ pub const Explorer = struct {
+     /// Build the resolved call graph once (idempotent, mutex-guarded). Must be
+     /// called while holding at least a shared lock on `mu`. Retains edges for
+     /// codedb_callpath and computes per-file centrality (PageRank by default).
+-    fn ensureCallGraphMode(self: *Explorer, allocator: std.mem.Allocator, exact: bool) void {
+-        if (self.call_graph != null and (!exact or self.call_graph_exact)) return;
++    fn ensureCallGraphMode(self: *Explorer, exact: bool) void {
++        if (self.publishedCallGraph(exact) != null) return;
+         // #564: never build (and cache) a graph from a deferred symbol index —
+         // resolveCallees would see no definitions and the empty graph would be
+         // cached forever. Callers that need the graph ensureSymbolIndex first;
+@@ -6113,18 +6121,14 @@ pub const Explorer = struct {
+         self.centrality_build_mu.lock();
+         defer self.centrality_build_mu.unlock();
+         if (self.call_graph != null and (!exact or self.call_graph_exact)) return;
+-        if (exact) {
+-            if (self.call_graph) |*cg| cg.deinit(self.allocator);
+-            self.call_graph = null;
+-            self.call_graph_exact = false;
+-        }
++        if (self.call_graph != null) self.retired_call_graphs.ensureUnusedCapacity(self.allocator, 1) catch return;
+ 
+-        var arena_state = std.heap.ArenaAllocator.init(allocator);
++        // Edits rebuild this graph, so keep only function bodies and each file's
++        // bytes only while it is parsed. Page-backed: malloc keeps large freed blocks dirty.
++        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+         defer arena_state.deinit();
+         const a = arena_state.allocator();
+-        // Edits rebuild this graph, so keep only function bodies and each file's
+-        // bytes only while it is parsed: the peak is the bodies, not the corpus.
+-        var file_arena = std.heap.ArenaAllocator.init(self.allocator);
++        var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+         defer file_arena.deinit();
+ 
+         var node_path: std.ArrayList([]const u8) = .empty;
+@@ -6340,6 +6344,7 @@ pub const Explorer = struct {
+             return;
+         };
+ 
++        var new_centrality: ?std.StringHashMap(f32) = null;
+         if (self.call_centrality == null) {
+             var cmap = std.StringHashMap(f32).init(self.allocator);
+             for (node_path.items, node_scores.?) |path, score| {
+@@ -6348,36 +6353,57 @@ pub const Explorer = struct {
+                 if (!gop.found_existing) gop.value_ptr.* = 0;
+                 gop.value_ptr.* += score;
+             }
+-            self.call_centrality = cmap;
++            new_centrality = cmap;
+         }
+ 
+-        self.call_graph = .{
+-            .edges = edges_owned,
+-            .adj = adj,
+-            .radj = radj,
+-            .node_path = np,
+-            .node_name = nn,
+-            .node_line = nl,
+-        };
+-        self.call_graph_exact = exact;
++        {
++            self.call_graph_publish_mu.lock();
++            defer self.call_graph_publish_mu.unlock();
++            if (new_centrality) |cmap| self.call_centrality = cmap;
++            if (self.call_graph) |old| self.retired_call_graphs.appendAssumeCapacity(old);
++            self.call_graph = .{
++                .edges = edges_owned,
++                .adj = adj,
++                .radj = radj,
++                .node_path = np,
++                .node_name = nn,
++                .node_line = nl,
++            };
++            self.call_graph_exact = exact;
++        }
+         // The graph-distance boost gate (`call_graph != null`) just flipped:
+         // results cached before the build could differ from a fresh search.
+         self.bumpSearchGen();
+     }
+ 
+-    fn ensureCallGraph(self: *Explorer, allocator: std.mem.Allocator) void {
+-        self.ensureCallGraphMode(allocator, false);
++    /// Caller holds `mu` shared; the copy stays valid until an exclusive `mu`.
++    fn publishedCallGraph(self: *Explorer, exact_only: bool) ?CallGraph {
++        self.call_graph_publish_mu.lock();
++        defer self.call_graph_publish_mu.unlock();
++        if (exact_only and !self.call_graph_exact) return null;
++        return self.call_graph;
++    }
++
++    /// Caller holds `mu` shared; the copy stays valid until an exclusive `mu`.
++    pub fn publishedCentrality(self: *Explorer) ?std.StringHashMap(f32) {
++        self.call_graph_publish_mu.lock();
++        defer self.call_graph_publish_mu.unlock();
++        return self.call_centrality;
++    }
++
++    fn ensureCallGraph(self: *Explorer) void {
++        self.ensureCallGraphMode(false);
+     }
+ 
+-    fn ensureExactCallGraph(self: *Explorer, allocator: std.mem.Allocator) void {
+-        self.ensureCallGraphMode(allocator, true);
++    fn ensureExactCallGraph(self: *Explorer) void {
++        self.ensureCallGraphMode(true);
+     }
+ 
+     /// Build `call_centrality` once (idempotent, mutex-guarded). Must be called
+     /// while holding at least a shared lock on `mu`.
+-    fn ensureCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
+-        if (self.call_centrality != null) return;
+-        self.ensureCallGraph(allocator);
++    fn ensureCallCentrality(self: *Explorer) void {
++        if (self.publishedCentrality() != null) return;
++        self.ensureCallGraph();
+     }
+ 
+     /// Shortest resolved call chain between two symbol names. Returns owned steps
+@@ -6406,8 +6432,8 @@ pub const Explorer = struct {
+         self.mu.lockShared();
+         defer self.mu.unlockShared();
+ 
+-        self.ensureExactCallGraph(allocator);
+-        const cg = self.call_graph orelse return try allocator.alloc(CallPathStep, 0);
++        self.ensureExactCallGraph();
++        const cg = self.publishedCallGraph(true) orelse return try allocator.alloc(CallPathStep, 0);
+ 
+         var candidates: std.ArrayList(CallPathStep) = .empty;
+         errdefer {
+@@ -6442,8 +6468,8 @@ pub const Explorer = struct {
+         self.mu.lockShared();
+         defer self.mu.unlockShared();
+ 
+-        self.ensureExactCallGraph(allocator);
+-        const cg = self.call_graph orelse return null;
++        self.ensureExactCallGraph();
++        const cg = self.publishedCallGraph(true) orelse return null;
+ 
+         var from_ids: std.ArrayList(codegraph.NodeId) = .empty;
+         defer from_ids.deinit(allocator);
+@@ -6555,7 +6581,7 @@ pub const Explorer = struct {
+         // once and fold it in as an additive boost. On by default (MRR-validated
+         // on the codedb set: 0.819 -> 0.944, +4 P@1, no recall loss); set
+         // CODEDB_NO_CENTRALITY to disable.
+-        if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null) self.ensureCallCentrality(allocator);
++        if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null) self.ensureCallCentrality();
+ 
+         // Tokenize the query the same way WordIndex tokenizes documents:
+         // lowercase + identifier-split. Dedupe terms so repeated query words
+@@ -6604,11 +6630,11 @@ pub const Explorer = struct {
+         if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
+             cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null)
+         {
+-            if (self.call_graph == null) {
++            if (self.publishedCallGraph(false) == null) {
+                 var gate_tok = idx.WordTokenizer{ .buf = query };
+                 while (gate_tok.next()) |w| {
+                     if (self.symbol_index.contains(w)) {
+-                        self.ensureCallGraph(allocator);
++                        self.ensureCallGraph();
+                         break;
+                     }
+                 }
+diff --git a/src/mcp.zig b/src/mcp.zig
+index 7cae6ba..0a71af4 100644
+--- a/src/mcp.zig
++++ b/src/mcp.zig
+@@ -6092,7 +6092,7 @@ fn handleIndex(
+             std.heap.c_allocator.destroy(trigram);
+         }
+         trigram.writeToDisk(io, data_dir, git_head) catch |err| break :blk err;
+-        build_explorer.buildCallCentrality(alloc);
++        build_explorer.buildCallCentrality();
+         snapshot_mod.writeSnapshotDual(io, &build_explorer, abs_path, snapshot_path, alloc) catch |err| break :blk err;
+         break :blk null;
+     };
+diff --git a/src/snapshot.zig b/src/snapshot.zig
+index 440e999..de22d1a 100644
+--- a/src/snapshot.zig
++++ b/src/snapshot.zig
+@@ -413,11 +413,12 @@ pub fn writeSnapshot(
+     // under the shared lock held above; never builds here.
+     {
+         const offset = file_writer.logicalPos();
+-        const count: u32 = if (explorer.call_centrality) |cm| @intCast(cm.count()) else 0;
++        const centrality = explorer.publishedCentrality();
++        const count: u32 = if (centrality) |cm| @intCast(cm.count()) else 0;
+         var count_buf: [4]u8 = undefined;
+         std.mem.writeInt(u32, &count_buf, count, .little);
+         try fw.writeAll(&count_buf);
+-        if (explorer.call_centrality) |cm| {
++        if (centrality) |cm| {
+             var it = cm.iterator();
+             while (it.next()) |e| {
+                 const key = e.key_ptr.*;
+diff --git a/src/test_explore.zig b/src/test_explore.zig
+index d7fcbb2..da5ffaf 100644
+--- a/src/test_explore.zig
++++ b/src/test_explore.zig
+@@ -3364,6 +3364,30 @@ test "call path results stay valid after the graph is dropped" {
+     try testing.expectEqualStrings("callee.zig", candidates[0].path);
+ }
+ 
++test "an exact call graph upgrade keeps the approximate graph alive for readers" {
++    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
++    defer explorer_inst.deinit();
++    try explorer_inst.indexFile("caller.zig", "pub fn alpha() void {\n    beta();\n}\n");
++    try explorer_inst.indexFile("callee.zig", "pub fn beta() void {}\n");
++    try explorer_inst.indexFile("other.zig", "pub fn other() void {}\n");
++    explorer_inst.buildCallCentrality();
++    try testing.expect(!explorer_inst.call_graph_exact);
++    // A ranked search in another session copies the graph under a shared lock.
++    const held = explorer_inst.call_graph orelse return error.TestExpectedEqual;
++
++    const candidates = try explorer_inst.findCallPathCandidates("beta", null, testing.allocator);
++    defer Explorer.freeCallPathSteps(testing.allocator, candidates);
++    try testing.expect(explorer_inst.call_graph_exact);
++    var names: usize = 0;
++    for (held.node_name) |name| {
++        if (std.mem.eql(u8, name, "alpha") or std.mem.eql(u8, name, "beta") or std.mem.eql(u8, name, "other")) names += 1;
++    }
++    try testing.expectEqual(@as(usize, 3), names);
++
++    explorer_inst.removeFile("other.zig");
++    try testing.expectEqual(@as(usize, 0), explorer_inst.retired_call_graphs.items.len);
++}
++
+ test "trigramAdmits keeps admission for indexed files and caps new ones" {
+     var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+     defer explorer_inst.deinit();
+@@ -3524,7 +3548,7 @@ test "issue-725: call graph follows an exact Zig re-export chain" {
+ 
+     // Ranking may build the fast approximate graph first; callpath must replace
+     // it with strict import-aware resolution rather than reusing stale edges.
+-    explorer_inst.buildCallCentrality(testing.allocator);
++    explorer_inst.buildCallCentrality();
+ 
+     const imported = (try explorer_inst.findCallPath("main", "run", testing.allocator, 4)) orelse
+         return error.TestExpectedEqual;
+diff --git a/src/test_snapshot.zig b/src/test_snapshot.zig
+index 92b9e00..89c64da 100644
+--- a/src/test_snapshot.zig
++++ b/src/test_snapshot.zig
+@@ -341,7 +341,7 @@ test "snapshot: call-graph centrality persists and restores (no lazy rebuild)" {
+         \\
+     );
+ 
+-    exp.buildCallCentrality(testing.allocator);
++    exp.buildCallCentrality();
+     try testing.expect(exp.call_centrality != null);
+     const want = exp.call_centrality.?.get("cc_pkg/util.zig") orelse 0.0;
+     try testing.expect(want > 0.0);

@@ -1,0 +1,1654 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alfred Ben <e0958604@u.nus.edu>
+Date: Fri, 30 Oct 2026 17:24:01 +0800
+Subject: [PATCH 3/5] mcp: share one MCP server per project root
+
+Every `codedb mcp` stdio session ran its own index process, so N agent
+sessions on one repo held N copies of the index. `codedb mcp` now
+forwards to one `mcp-server` per project root over a private Unix
+socket; the server exits after CODEDB_MCP_IDLE_MS without clients.
+CODEDB_MCP_SHARED=0 restores in-process serving, and any socket error
+falls back to it.
+
+- private socket dir, all inherited fds closed, key mismatch refused
+- the word index is built once when concurrent sessions miss it
+- a project that names the server's own root reuses the shared index
+- ADR 0012 and docs/mcp.md, docs/cli.md describe the model
+
+10 concurrent clients: 1 server at 179 MB warm (peak 227) plus 1.2 MB
+per forwarder.
+---
+ docs/adr/0012-shared-mcp-server.md |  79 ++++
+ docs/adr/README.md                 |   2 +
+ docs/cli.md                        |   3 +
+ docs/mcp.md                        |  38 +-
+ src/bootstrap.zig                  |   2 +-
+ src/cio.zig                        |  15 +-
+ src/cli_args.zig                   |   2 +-
+ src/cli_proxy.zig                  |  18 +-
+ src/commands.zig                   |  77 +++-
+ src/main.zig                       |  12 +
+ src/mcp.zig                        | 152 ++++---
+ src/mcp_shared.zig                 | 676 +++++++++++++++++++++++++++++
+ src/test_mcp.zig                   |  65 +++
+ 13 files changed, 1058 insertions(+), 83 deletions(-)
+ create mode 100644 docs/adr/0012-shared-mcp-server.md
+ create mode 100644 src/mcp_shared.zig
+
+diff --git a/docs/adr/0012-shared-mcp-server.md b/docs/adr/0012-shared-mcp-server.md
+new file mode 100644
+index 0000000..19dd27e
+--- /dev/null
++++ b/docs/adr/0012-shared-mcp-server.md
+@@ -0,0 +1,79 @@
++# ADR 0012: One shared MCP server per project root
++
++Status: implemented on branch `shared-daemon`.
++
++## Context
++
++Each Claude or Codex agent starts its own `codedb mcp` stdio process, and each
++process builds its own index of the same repository. On one Mac, 21 parallel
++agents gave 24 codedb processes at 1.4-3.1 GB `footprint -p` each, and the
++machine ran out of memory.
++
++## Decision
++
++`codedb mcp` becomes a thin stdio forwarder when its root is known at launch.
++It connects to `codedb <root> mcp-server` over a Unix socket in
++`~/.codedb/run`, and starts that server when none runs.
++
++1. Key. A Wyhash of the codedb version, the root, the effective config,
++   `--no-telemetry` and the `CODEDB_*` environment. Clients that would run
++   different servers never share one, and a new binary gets a new server.
++2. One server per key. The client takes `flock(<key>.lock)` and passes the
++   locked fd to the server as fd 3. The lock has no gap between client and
++   server, so 20 clients that start in the same second start one server.
++3. Detached server. A double fork with `setsid` reparents the server to init,
++   so killing one agent's process tree does not stop it. Its stdin and stdout
++   are `/dev/null`, its stderr is `<key>.log`, and it closes every other fd so
++   that it never holds an agent's pipes open.
++4. Handshake. The client sends `codedb-mcp-shared/1 <key>`, and the server
++   answers `ready` after its index load. The client reads stdin only after
++   `ready`. Any earlier failure falls back to in-process serving with no lost
++   bytes, and the log names the reason.
++5. Sessions. One thread per client, each with its own `Session`,
++   `ProjectCache` and broken-pipe flag, so one dead client ends only its own
++   session. The Explorer, Store, watcher, agent registry, telemetry and CLI
++   proxy listener are shared.
++6. Lifetime. The accept loop exits after `CODEDB_MCP_IDLE_MS` (default 5 min)
++   without a session. Admission and the idle verdict run on one thread. The
++   server releases the lock when its listener closes, so a later client can
++   start the next server at once.
++
++7. Trust. The socket directory must be a real directory that the user owns
++   and that group and others cannot write. The lock and log open with
++   `O_NOFOLLOW`, the socket is 0600, and both ends check the peer uid.
++8. One index per root, also for explicit calls. A `project` argument that
++   names the server's own root uses the shared index, not a per-session
++   snapshot copy.
++
++Concurrent sessions exposed one shared-state cost: `Explorer.rebuildWordIndex`
++had no single-flight guard, so N sessions that missed the word index each read
++every file and built a full copy. A build mutex with a re-check of
++`word_index_complete` makes them wait for one build.
++
++## Rejected alternatives
++
++- The existing CLI proxy socket. Its framed request and response protocol
++  cannot carry server-to-client requests such as `roots/list`, or connections
++  that last hours.
++- `codedb serve`. It is HTTP on one fixed port and has no MCP endpoint.
++- An external `mcp-proxy` per root. It works, but each client costs 35-65 MB of
++  Python, and the root registry would live outside codedb.
++
++## Consequences
++
++Measured on a 16k-file repository with 10 concurrent clients (initialize,
++tools/list, codedb_search each): one server at 567 MB warm and 858 MB cold
++(peak 859 MB), plus 10 forwarders at 1.2 MB each. In-process mode uses about
++530 MB per client warm, about 5.3 GB for 10.
++
++Costs:
++
++- One server is a shared failure domain. A crash ends every session on that
++  root, and the MCP clients must restart `codedb mcp`.
++- Tool calls from different agents now run concurrently on one Explorer.
++  Explorer already takes a reader-writer lock, and the CLI proxy already ran
++  calls concurrently with the MCP session, but contention is new at this scale.
++- A socket path longer than 104 bytes (a very long HOME or
++  `CODEDB_MCP_SOCKET_DIR`) falls back to in-process mode.
++- Roots that come only from the client's `roots/list` and `CODEDB_LAZY_MCP`
++  sessions stay in-process. Windows stays in-process.
+diff --git a/docs/adr/README.md b/docs/adr/README.md
+index 2ed1f53..eee2fae 100644
+--- a/docs/adr/README.md
++++ b/docs/adr/README.md
+@@ -1,5 +1,7 @@
+ # Retrieval decisions
+ 
++- [ADR 0012](0012-shared-mcp-server.md): one shared MCP server per project root.
++
+ - [ADR 0011](0011-release-intent-guards.md): release hardening for testing-infrastructure and call/use intent.
+ 
+ - [ADR 0010](0010-multilingual-datasets-and-test-intent.md): current multilingual suite, native test-intent improvement, and frozen Requests results.
+diff --git a/docs/cli.md b/docs/cli.md
+index 45ecbbc..2e505b7 100644
+--- a/docs/cli.md
++++ b/docs/cli.md
+@@ -162,6 +162,9 @@ codedb-cli stop                       # stop daemon
+ | `CODEDB_EMBEDDINGS_TOKEN` | unset | Optional legacy bearer token for protected/custom endpoints; the hosted lane enrolls automatically |
+ | `CODEDB_EMBEDDINGS_TIMEOUT_MS` | `15000` | Per-request deadline in milliseconds (10-120000) |
+ | `CODEDB_SEMANTIC_INDEX_CONCURRENCY` | `8` | Parallel 100-item index batches (clamped to 1-8) |
++| `CODEDB_MCP_SHARED` | on | `0` makes `codedb mcp` serve in-process instead of through the shared per-root server ([docs/mcp.md](mcp.md#shared-server-one-index-per-project-root)) |
++| `CODEDB_MCP_SOCKET_DIR` | `~/.codedb/run` | Socket, lock and log directory of the shared MCP servers |
++| `CODEDB_MCP_IDLE_MS` | `300000` | Idle time before a shared MCP server exits |
+ 
+ ## Performance
+ 
+diff --git a/docs/mcp.md b/docs/mcp.md
+index c6bb49d..38f86b8 100644
+--- a/docs/mcp.md
++++ b/docs/mcp.md
+@@ -514,6 +514,38 @@ Override the default:
+   full design + safety logic for project-root detection
+ - [Telemetry](telemetry.md) — what codedb sends, how to disable
+ 
++## Shared server: one index per project root
++
++Each agent starts its own `codedb mcp`. On macOS and Linux, all `codedb mcp`
++processes for one project root now share one index. The first one starts a
++background `codedb <root> mcp-server`. Each `codedb mcp` then only copies its
++stdio to that server over a Unix socket and uses about 1 MB. The server keeps
++one index and one watcher. It gives each client its own MCP session, so request
++ids, `initialize`, `roots/list` and the per-call `project` argument work as
++before.
++
++Clients share a server only when they would run the same server: the same
++codedb version, root, `.codedbrc` and config values, `--no-telemetry`, and
++`CODEDB_*` environment. Clients that differ get separate servers.
++
++The server stops after 5 minutes without a client. When it cannot be reached
++or started, `codedb mcp` serves in-process as before and logs the reason to
++stderr, for example `shared server unavailable (SocketDirNotWritable)`.
++
++Sharing applies to roots that are known at launch: a positional root,
++`CODEDB_ROOT`, or the git root of the working directory. It does not apply to
++`CODEDB_LAZY_MCP=1` or to roots that come only from the client's `roots/list`.
++
++| Variable | Default | Effect |
++|---|---|---|
++| `CODEDB_MCP_SHARED` | on | `0` serves every session in-process. |
++| `CODEDB_MCP_SOCKET_DIR` | `~/.codedb/run` | Directory for `<key>.sock`, `<key>.lock` and the server log `<key>.log`. It must be a real directory that you own and that group and others cannot write (codedb creates it 0700). The socket path must fit in 104 bytes. |
++| `CODEDB_MCP_IDLE_MS` | `300000` | Time without a client before the server exits. |
++
++Look at `~/.codedb/run/<key>.log` when a server misbehaves. `pkill -f
++'codedb .* mcp-server'` stops all shared servers. Their clients then lose the
++session and the MCP client restarts `codedb mcp`.
++
+ ## Experimental lazy startup
+ 
+ Set `CODEDB_LAZY_MCP=1` in your client's codedb MCP server environment, preserving
+@@ -538,6 +570,6 @@ watchers continue normally once started.
+ 
+ Lazy sessions skip speculative warmup and the MCP process's CLI proxy. CLI calls
+ use their existing standalone/daemon fallback, which can increase startup cost.
+-This option helps sessions that never query code; it does not share worktree
+-indexes, consolidate processes, change retrieval ranking, or reduce active
+-watcher work.
++This option helps sessions that never query code. Lazy sessions do not use the
++shared server, and the option does not change retrieval ranking or reduce
++active watcher work.
+diff --git a/src/bootstrap.zig b/src/bootstrap.zig
+index eaeef02..56958b0 100644
+--- a/src/bootstrap.zig
++++ b/src/bootstrap.zig
+@@ -474,7 +474,7 @@ pub fn coldLoadOrScan(
+     data_dir: []const u8,
+     freq_table_heap: *?*[256][256]u16,
+ ) !void {
+-    if (std.mem.eql(u8, cmd, "mcp")) return;
++    if (std.mem.eql(u8, cmd, "mcp") or std.mem.eql(u8, cmd, "mcp-server")) return;
+ 
+     const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
+ 
+diff --git a/src/cio.zig b/src/cio.zig
+index 41c713b..ac19882 100644
+--- a/src/cio.zig
++++ b/src/cio.zig
+@@ -579,6 +579,11 @@ pub const RunOptions = struct {
+ };
+ extern "c" fn _NSGetEnviron() *[*:null]?[*:0]u8;
+ 
++/// The live process environment as a NULL-terminated "NAME=VALUE" array (POSIX).
++pub fn environ() [*:null]const ?[*:0]const u8 {
++    return if (builtin.os.tag == .macos) @ptrCast(_NSGetEnviron().*) else @ptrCast(std.c.environ);
++}
++
+ // posix_spawn family — declared directly via extern "c" so this builds on
+ // both Darwin and Linux. (std.c.posix_spawnp is gated to .isDarwin() in 0.16
+ // and would fail to compile on Linux even though glibc/musl provide it.)
+@@ -790,10 +795,7 @@ fn runCapturePosix(opts: RunOptions) !CaptureResult {
+     _ = posix_spawn_file_actions_addclose(fa, err_pipe[0]);
+     _ = posix_spawn_file_actions_addclose(fa, err_pipe[1]);
+ 
+-    const envp: [*:null]const ?[*:0]const u8 = if (builtin.os.tag == .macos)
+-        @ptrCast(_NSGetEnviron().*)
+-    else
+-        @ptrCast(std.c.environ);
++    const envp = environ();
+ 
+     var pid: pid_t = 0;
+     if (posix_spawnp(&pid, c_argv[0].?, fa, null, c_argv_z, envp) != 0)
+@@ -968,10 +970,7 @@ fn spawnDetachedPosix(allocator: std.mem.Allocator, argv: []const []const u8) vo
+     _ = posix_spawn_file_actions_addopen(fa, 1, devnull, 2, 0);
+     _ = posix_spawn_file_actions_addopen(fa, 2, devnull, 2, 0);
+ 
+-    const envp: [*:null]const ?[*:0]const u8 = if (builtin.os.tag == .macos)
+-        @ptrCast(_NSGetEnviron().*)
+-    else
+-        @ptrCast(std.c.environ);
++    const envp = environ();
+ 
+     var pid: pid_t = 0;
+     // Fire and forget: no waitpid. The child reparents to init once this CLI
+diff --git a/src/cli_args.zig b/src/cli_args.zig
+index 9cb5950..6c46bdc 100644
+--- a/src/cli_args.zig
++++ b/src/cli_args.zig
+@@ -243,7 +243,7 @@ pub fn isValidMcpFlag(arg: []const u8) bool {
+ fn isCommand(arg: []const u8) bool {
+     // cli_query_cmds is the shared query-command table (see its doc); only the
+     // non-query commands are listed here.
+-    const commands = cli_query_cmds ++ [_][]const u8{ "snapshot", "semantic-index", "serve", "mcp", "update", "nuke", "codex", "cli-daemon", "index", "reindex" };
++    const commands = cli_query_cmds ++ [_][]const u8{ "snapshot", "semantic-index", "serve", "mcp", "mcp-server", "update", "nuke", "codex", "cli-daemon", "index", "reindex" };
+     for (commands) |c| {
+         if (std.mem.eql(u8, arg, c)) return true;
+     }
+diff --git a/src/cli_proxy.zig b/src/cli_proxy.zig
+index b5fd5c0..e46b2d9 100644
+--- a/src/cli_proxy.zig
++++ b/src/cli_proxy.zig
+@@ -427,7 +427,7 @@ fn createCliPipeInstance(pipe_name: [:0]const u8, first_instance: bool, sa_pipe:
+ /// Fill a sockaddr.un for `path` (which must be NUL-terminatable into sun_path).
+ /// Returns the struct plus the byte length to pass to bind/connect. Path is
+ /// guaranteed short by cliSocketPath, but we guard the copy regardless.
+-fn cliFillSockaddr(path: []const u8) ?SockAddr {
++pub fn cliFillSockaddr(path: []const u8) ?SockAddr {
+     var addr: std.c.sockaddr.un = .{ .family = std.c.AF.UNIX, .path = undefined };
+     if (path.len + 1 > addr.path.len) return null;
+     @memcpy(addr.path[0..path.len], path);
+@@ -442,7 +442,7 @@ fn cliFillSockaddr(path: []const u8) ?SockAddr {
+ /// Returns false on EOF-before-full or a hard error (EINTR is retried).
+ const CliConn = if (builtin.os.tag == .windows) win.HANDLE else c_int;
+ 
+-fn connRead(conn: CliConn, buf: []u8) ?usize {
++pub fn connRead(conn: CliConn, buf: []u8) ?usize {
+     if (builtin.os.tag == .windows) {
+         var got: u32 = 0;
+         const want: u32 = @intCast(@min(buf.len, std.math.maxInt(u32)));
+@@ -482,7 +482,7 @@ fn cliReadFull(conn: CliConn, buf: []u8) bool {
+ 
+ /// Write all of `data` to a blocking fd, looping over short/partial writes.
+ /// Returns false on a hard error (EINTR is retried).
+-fn cliWriteFull(conn: CliConn, data: []const u8) bool {
++pub fn cliWriteFull(conn: CliConn, data: []const u8) bool {
+     var off: usize = 0;
+     while (off < data.len) {
+         const n = connWrite(conn, data[off..]) orelse return false;
+@@ -537,13 +537,13 @@ pub fn daemonLockAvailable(data_dir: []const u8) bool {
+ }
+ 
+ /// Named sockaddr.un bundle: the struct plus the byte length for bind()/connect().
+-const SockAddr = struct { addr: std.c.sockaddr.un, len: std.c.socklen_t };
++pub const SockAddr = struct { addr: std.c.sockaddr.un, len: std.c.socklen_t };
+ 
+ /// One attempt to OWN the project socket: socket() + bind() + chmod 0600 +
+ /// listen(). Returns the listening fd, or null if the path is already taken or
+ /// a syscall failed (the fd is closed on any failure). Never unlinks — the
+ /// caller decides whether a taken path is stale.
+-fn cliBindListen(sa: SockAddr, sock_path_z: [:0]const u8) ?c_int {
++pub fn cliBindListen(sa: SockAddr, sock_path_z: [:0]const u8, backlog: c_uint) ?c_int {
+     const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+     if (fd < 0) return null;
+     var sa_mut = sa;
+@@ -555,7 +555,7 @@ fn cliBindListen(sa: SockAddr, sock_path_z: [:0]const u8) ?c_int {
+     // ignores fchmod() on a socket fd. Safe before listen() — no client can
+     // connect yet. Non-fatal.
+     _ = std.c.chmod(sock_path_z.ptr, 0o600);
+-    if (std.c.listen(fd, 16) != 0) {
++    if (std.c.listen(fd, backlog) != 0) {
+         _ = std.c.close(fd);
+         return null;
+     }
+@@ -612,12 +612,12 @@ pub fn cliAcquireListener(sock_path: []const u8, retry: bool, retry_interval_ms:
+     const sa = cliFillSockaddr(sock_path) orelse return null;
+     var yield_sent = false;
+     while (true) {
+-        if (cliBindListen(sa, sock_path_z)) |fd| return fd;
++        if (cliBindListen(sa, sock_path_z, 16)) |fd| return fd;
+         // Bind failed: the path exists. Clear it only when no one is listening
+         // (stale node), never when a live owner still holds it.
+         if (!cliSocketLive(sa)) {
+             _ = std.c.unlink(sock_path_z.ptr);
+-            if (cliBindListen(sa, sock_path_z)) |fd| return fd;
++            if (cliBindListen(sa, sock_path_z, 16)) |fd| return fd;
+         } else if (retry and !yield_sent) {
+             yield_sent = true;
+             cliSendYieldRequest(sa);
+@@ -1150,7 +1150,7 @@ fn cliConnect(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8, da
+ 
+ extern "c" fn getpeereid(fd: c_int, uid: *std.c.uid_t, gid: *std.c.gid_t) c_int;
+ 
+-fn unixPeerTrusted(fd: c_int) bool {
++pub fn unixPeerTrusted(fd: c_int) bool {
+     if (comptime builtin.os.tag == .linux) {
+         const Credentials = extern struct { pid: std.c.pid_t, uid: std.c.uid_t, gid: std.c.gid_t };
+         var peer: Credentials = undefined;
+diff --git a/src/commands.zig b/src/commands.zig
+index da5ab1a..77a8995 100644
+--- a/src/commands.zig
++++ b/src/commands.zig
+@@ -22,6 +22,7 @@ const index_mod = @import("index.zig");
+ const Config = @import("config.zig").Config;
+ const Out = @import("out.zig").Out;
+ const cli_proxy = @import("cli_proxy.zig");
++const mcp_shared = @import("mcp_shared.zig");
+ const cliDaemonListen = cli_proxy.cliDaemonListen;
+ const cliSocketPath = cli_proxy.cliSocketPath;
+ const bootstrap = @import("bootstrap.zig");
+@@ -447,6 +448,51 @@ pub fn runServe(ctx: *RunCtx) !void {
+ }
+ 
+ pub fn runMcp(ctx: *RunCtx) !void {
++    try serveMcp(ctx, .stdio);
++}
++
++/// Hidden command that `codedb mcp` forwards to: one index for every client
++/// of its key, exiting after CODEDB_MCP_IDLE_MS without a client.
++pub fn runMcpServer(ctx: *RunCtx) !void {
++    const args = ctx.args[ctx.cmd_args_start..];
++    var shared = mcp_shared.Server.bind(ctx.io, ctx.abs_root, ctx.cfg, ctx.no_telemetry, mcp_shared.inheritedLockFd(args), mcp_shared.spawnedKey(args), mcp_shared.idleMsFromEnv()) orelse {
++        std.log.info("codedb mcp-server: another server owns this key, or its socket cannot be bound; exiting", .{});
++        return;
++    };
++    try serveMcp(ctx, .{ .shared = &shared });
++    // Detached workers (CLI proxy, warmup) may still read the index, so exit
++    // here instead of returning into mainImpl's deinit defers.
++    std.process.exit(0);
++}
++
++const McpTransport = union(enum) {
++    stdio,
++    shared: *mcp_shared.Server,
++};
++
++/// Clients of one shared server: they share the index, and each keeps its own
++/// MCP session state.
++const SharedSessions = struct {
++    io: std.Io,
++    allocator: std.mem.Allocator,
++    store: *Store,
++    explorer: *Explorer,
++    agents: *AgentRegistry,
++    abs_root: []const u8,
++    max_cached: u32,
++    telem: *telemetry.Telemetry,
++    shutdown: *std.atomic.Value(bool),
++
++    pub fn runSession(self: *const SharedSessions, conn: c_int) void {
++        self.telem.recordSessionStart();
++        var broken = std.atomic.Value(bool).init(false);
++        const in: std.Io.File = .{ .handle = conn, .flags = .{ .nonblocking = false } };
++        const rpc: mcp_server.RpcOut = .{ .file = .{ .handle = conn }, .broken = &broken };
++        mcp_server.runPeer(self.io, self.allocator, in, rpc, self.store, self.explorer, self.agents, self.abs_root, self.max_cached, self.telem, null, self.shutdown);
++    }
++};
++
++fn serveMcp(ctx: *RunCtx, transport: McpTransport) !void {
+     const io = ctx.io;
+     const allocator = ctx.allocator;
+     const abs_root = ctx.abs_root;
+@@ -466,7 +512,8 @@ pub fn runMcp(ctx: *RunCtx) !void {
+     defer agents.deinit();
+     _ = try agents.register("__filesystem__");
+ 
+-    const root_from_cwd = mcp_deferred_root;
++    const stdio = transport == .stdio;
++    const root_from_cwd = stdio and mcp_deferred_root;
+ 
+     saveProjectInfo(io, allocator, data_dir, abs_root) catch {};
+ 
+@@ -482,7 +529,7 @@ pub fn runMcp(ctx: *RunCtx) !void {
+     var telem = telemetry.Telemetry.init(io, data_dir, allocator, telemetry_disabled);
+     defer telem.deinit();
+     telem.startSyncThread();
+-    telem.recordSessionStart();
++    if (stdio) telem.recordSessionStart();
+ 
+     var shutdown = std.atomic.Value(bool).init(false);
+ 
+@@ -496,7 +543,7 @@ pub fn runMcp(ctx: *RunCtx) !void {
+     var deferred: mcp_server.DeferredScan = undefined;
+     var maybe_deferred: ?*mcp_server.DeferredScan = null;
+ 
+-    const lazy_start = cio.posixGetenv("CODEDB_LAZY_MCP") != null;
++    const lazy_start = stdio and cio.posixGetenv("CODEDB_LAZY_MCP") != null;
+     if (root_from_cwd or lazy_start) {
+         deferred = .{
+             .io = io,
+@@ -538,7 +585,7 @@ pub fn runMcp(ctx: *RunCtx) !void {
+         watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ io, store, explorer, queue, root, &shutdown, &scan_done, cfg.max_watched });
+     }
+ 
+-    const idle_thread = try std.Thread.spawn(.{}, idleWatchdog, .{&shutdown});
++    const idle_thread: ?std.Thread = if (stdio) try std.Thread.spawn(.{}, idleWatchdog, .{&shutdown}) else null;
+ 
+     std.log.info("codedb mcp: root={s} files={d} data={s} scan={s}", .{ abs_root, store.currentSeq(), data_dir, mcp_server.getScanState().name() });
+ 
+@@ -561,7 +608,25 @@ pub fn runMcp(ctx: *RunCtx) !void {
+         }
+         spawnWarmup(io, allocator, explorer, data_dir, abs_root, &shutdown);
+     }
+-    mcp_server.run(io, allocator, store, explorer, &agents, abs_root, cfg.max_cached, &telem, maybe_deferred, &shutdown);
++    switch (transport) {
++        .stdio => mcp_server.run(io, allocator, store, explorer, &agents, abs_root, cfg.max_cached, &telem, maybe_deferred, &shutdown),
++        .shared => |shared| {
++            const sessions = SharedSessions{
++                .io = io,
++                .allocator = allocator,
++                .store = store,
++                .explorer = explorer,
++                .agents = &agents,
++                .abs_root = abs_root,
++                .max_cached = cfg.max_cached,
++                .telem = &telem,
++                .shutdown = &shutdown,
++            };
++            // Fill the env-policy cache before sessions read it concurrently.
++            _ = mcp_server.mcpEmitRichBlocks(null);
++            shared.serve(&sessions);
++        },
++    }
+ 
+     shutdown.store(true, .release);
+     if (scan_thread) |st| st.join();
+@@ -569,5 +634,5 @@ pub fn runMcp(ctx: *RunCtx) !void {
+         if (d.scan_thread) |st| st.join();
+     }
+     watch_thread.join();
+-    idle_thread.join();
++    if (idle_thread) |t| t.join();
+ }
+diff --git a/src/main.zig b/src/main.zig
+index 7ef2804..85cf44a 100644
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -134,6 +134,7 @@ const loadUserConfig = bootstrap.loadUserConfig;
+ const getDataDir = bootstrap.getDataDir;
+ 
+ const commands = @import("commands.zig");
++const mcp_shared = @import("mcp_shared.zig");
+ fn mainImpl(argv: []const [*:0]const u8) !void {
+     // Use c_allocator (libc malloc) — better page reclamation than GPA
+     const allocator = std.heap.c_allocator;
+@@ -465,6 +466,15 @@ fn mainImpl(argv: []const [*:0]const u8) !void {
+         break :blk Config.default;
+     };
+ 
++    // One index per root: hand this session to the shared server. Null means
++    // it could not be reached before any stdin byte was read, so serve here.
++    if (std.mem.eql(u8, cmd, "mcp") and !mcp_deferred_root and cio.posixGetenv("CODEDB_LAZY_MCP") == null) {
++        if (mcp_shared.forward(io, allocator, abs_root, cfg, no_telemetry, explicit_config)) |code| {
++            out.flush();
++            std.process.exit(code);
++        }
++    }
++
+     var store = Store.init(allocator);
+     store.max_versions = cfg.max_versions;
+     defer store.deinit();
+@@ -529,6 +539,8 @@ fn mainImpl(argv: []const [*:0]const u8) !void {
+         try commands.runServe(&ctx);
+     } else if (std.mem.eql(u8, cmd, "mcp")) {
+         try commands.runMcp(&ctx);
++    } else if (std.mem.eql(u8, cmd, "mcp-server")) {
++        try commands.runMcpServer(&ctx);
+     } else if (bootstrap.commandRebuildsIndex(cmd)) {
+         // `reindex` is the public spelling; `index` remains a compatibility
+         // alias. coldLoadOrScan above already
+diff --git a/src/mcp.zig b/src/mcp.zig
+index 27dcdfb..7cae6ba 100644
+--- a/src/mcp.zig
++++ b/src/mcp.zig
+@@ -336,6 +336,9 @@ const ProjectCache = struct {
+     default_deps_cache: DepsCache,
+     default_semantic_cache: semantic_index_mod.SearchCache,
+     content_cache_capacity: u32,
++    /// The default explorer stays rooted at `default_path` for the session,
++    /// so a `project` naming that root can use it instead of a snapshot copy.
++    default_root_fixed: bool = false,
+ 
+     fn init(alloc_: std.mem.Allocator, default_path_: []const u8, content_cache_capacity_: u32) ProjectCache {
+         return .{
+@@ -410,7 +413,8 @@ const ProjectCache = struct {
+         default_exp: *Explorer,
+         default_store: *Store,
+     ) !ProjectCtx {
+-        const raw_path = path orelse return ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache, .deps_cache = &self.default_deps_cache, .semantic_cache = &self.default_semantic_cache };
++        const default_ctx = ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache, .deps_cache = &self.default_deps_cache, .semantic_cache = &self.default_semantic_cache };
++        const raw_path = path orelse return default_ctx;
+         const parsed_path = local_uri.parseRootReference(self.alloc, raw_path) catch return error.PathNotAllowed;
+         defer self.alloc.free(parsed_path);
+ 
+@@ -419,6 +423,8 @@ const ProjectCache = struct {
+         defer if (candidate_live) candidate.deinit();
+         try candidate.setRoot(io, parsed_path);
+         const canonical_root = candidate.root_path orelse return error.PathNotAllowed;
++        // Each shared-server session would otherwise load its own copy of the root.
++        if (self.default_root_fixed and std.mem.eql(u8, canonical_root, self.default_path)) return default_ctx;
+ 
+         self.mu.lock();
+         defer self.mu.unlock();
+@@ -587,7 +593,8 @@ pub const BenchContext = struct {
+         agents: *AgentRegistry,
+         telem: *telemetry_mod.Telemetry,
+     ) void {
+-        handleCall(io, alloc, root, stdout, id, store, explorer, agents, &self.cache, telem, null, null, null, true, &.{});
++        var broken = std.atomic.Value(bool).init(false);
++        handleCall(io, alloc, root, .{ .file = stdout, .broken = &broken }, id, store, explorer, agents, &self.cache, telem, null, null, null, true, &.{});
+     }
+ 
+     pub fn runToolCall(
+@@ -1069,6 +1076,17 @@ pub const dead_client_poll_ms: u64 = 1000;
+ 
+ pub var stdout_broken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+ 
++/// Where one session writes JSON-RPC lines. `broken` belongs to that session,
++/// so a dead shared-server client ends only its own session.
++pub const RpcOut = struct {
++    file: cio.File,
++    broken: *std.atomic.Value(bool),
++
++    fn send(self: RpcOut, line: []const u8) void {
++        self.file.writeAll(line) catch self.broken.store(true, .release);
++    }
++};
++
+ // ── Serve-first scan state (issue #207) ─────────────────────────────────────
+ //
+ // MCP serves immediately on startup; the file walk + index build runs in a
+@@ -1119,7 +1137,7 @@ fn waitForScanReady(timeout_ms: u64) void {
+ 
+ const Session = struct {
+     alloc: std.mem.Allocator,
+-    stdout: cio.File,
++    rpc: RpcOut,
+     next_id: i64 = 100,
+     client_supports_roots: bool = false,
+     client_roots_list_changed: bool = false,
+@@ -1269,11 +1287,30 @@ pub fn run(
+     deferred_scan: ?*DeferredScan,
+     shutdown: *std.atomic.Value(bool),
+ ) void {
+-    const stdout = cio.File.stdout();
+-    const stdin = std.Io.File.stdin();
++    const stdio: RpcOut = .{ .file = cio.File.stdout(), .broken = &stdout_broken };
++    runPeer(io, alloc, std.Io.File.stdin(), stdio, store, explorer, agents, default_path, content_cache_capacity, telem, deferred_scan, shutdown);
++}
++
++/// One MCP session reading `in` and writing `rpc`: stdio for `codedb mcp`,
++/// one client socket per session of the shared `mcp-server`.
++pub fn runPeer(
++    io: std.Io,
++    alloc: std.mem.Allocator,
++    in: std.Io.File,
++    rpc: RpcOut,
++    store: *Store,
++    explorer: *Explorer,
++    agents: *AgentRegistry,
++    default_path: []const u8,
++    content_cache_capacity: u32,
++    telem: *telemetry_mod.Telemetry,
++    deferred_scan: ?*DeferredScan,
++    shutdown: *std.atomic.Value(bool),
++) void {
+     last_activity.store(cio.milliTimestamp(), .release);
+ 
+     var cache = ProjectCache.init(alloc, default_path, content_cache_capacity);
++    cache.default_root_fixed = deferred_scan == null;
+     defer cache.deinit();
+ 
+     // Build the `tools/list` payload. The discriminated `oneOf` on the
+@@ -1330,16 +1367,16 @@ pub fn run(
+     const profile_explicit = cio.posixGetenv("CODEDB_TOOLS_PROFILE") != null;
+     var session = Session{
+         .alloc = alloc,
+-        .stdout = stdout,
++        .rpc = rpc,
+         .deferred_scan = deferred_scan,
+     };
+     defer session.deinit();
+ 
+     var read_buf: [4096]u8 = undefined;
+-    var stdin_reader = stdin.reader(io, &read_buf);
++    var in_reader = in.reader(io, &read_buf);
+ 
+-    while (!stdout_broken.load(.acquire) and !shutdown.load(.acquire)) {
+-        const msg = mcpj.readLineBuf(alloc, &stdin_reader.interface) orelse break;
++    while (!rpc.broken.load(.acquire) and !shutdown.load(.acquire)) {
++        const msg = mcpj.readLineBuf(alloc, &in_reader.interface) orelse break;
+         last_activity.store(cio.milliTimestamp(), .release);
+         defer alloc.free(msg);
+ 
+@@ -1347,13 +1384,13 @@ pub fn run(
+         if (input.len == 0) continue;
+ 
+         const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
+-            writeError(alloc, stdout, null, -32700, "Parse error");
++            writeError(alloc, rpc, null, -32700, "Parse error");
+             continue;
+         };
+         defer parsed.deinit();
+ 
+         if (parsed.value != .object) {
+-            writeError(alloc, stdout, null, -32600, "Invalid Request");
++            writeError(alloc, rpc, null, -32600, "Invalid Request");
+             continue;
+         }
+ 
+@@ -1376,7 +1413,7 @@ pub fn run(
+         // UnsupportedProtocolVersionError instead of guessing.
+         if (!is_notification) {
+             if (unsupportedMetaProtocolVersion(root)) |requested| {
+-                writeUnsupportedProtocolVersionError(alloc, stdout, id, requested);
++                writeUnsupportedProtocolVersionError(alloc, rpc, id, requested);
+                 continue;
+             }
+         }
+@@ -1415,16 +1452,16 @@ pub fn run(
+                     break :blk if (modern_results) tools_list else "{\"tools\":[]}";
+                 };
+                 defer if (resp_owned) alloc.free(resp);
+-                writeResultVersioned(alloc, stdout, id, resp, modern_results);
++                writeResultVersioned(alloc, rpc, id, resp, modern_results);
+             }
+         } else if (mcpj.eql(method, "tools/call")) {
+-            handleCall(io, alloc, root, stdout, id, store, explorer, agents, &cache, telem, session.deferred_scan, &session.governor, session.client_name, requestUsesModernResults(root, session.modern_results), session.roots.items);
++            handleCall(io, alloc, root, rpc, id, store, explorer, agents, &cache, telem, session.deferred_scan, &session.governor, session.client_name, requestUsesModernResults(root, session.modern_results), session.roots.items);
+         } else if (mcpj.eql(method, "ping")) {
+-            if (!is_notification) writeResultVersioned(alloc, stdout, id, "{}", requestUsesModernResults(root, session.modern_results));
++            if (!is_notification) writeResultVersioned(alloc, rpc, id, "{}", requestUsesModernResults(root, session.modern_results));
+         } else if (mcpj.eql(method, "server/discover")) {
+-            if (!is_notification) writeResult(alloc, stdout, id, discover_result);
++            if (!is_notification) writeResult(alloc, rpc, id, discover_result);
+         } else {
+-            if (!is_notification) writeError(alloc, stdout, id, -32601, "Method not found");
++            if (!is_notification) writeError(alloc, rpc, id, -32601, "Method not found");
+         }
+     }
+ }
+@@ -1470,7 +1507,7 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
+         \\{{"protocolVersion":"{s}","capabilities":{{"tools":{{"listChanged":false}},"extensions":{{}}}},"serverInfo":{{"name":"codedb","version":"{s}"}},"instructions":"{s}"}}
+     , .{ negotiated, release_info.semver, mcp_instructions }) catch return;
+     defer s.alloc.free(init_result);
+-    writeResultVersioned(s.alloc, s.stdout, id, init_result, s.modern_results);
++    writeResultVersioned(s.alloc, s.rpc, id, init_result, s.modern_results);
+ }
+ /// Versions of the MCP spec this server has been verified against. Listed
+ /// newest-first because clients that send a newer version than we know
+@@ -1552,7 +1589,7 @@ pub fn requestUsesModernResults(root: *const std.json.ObjectMap, fallback: bool)
+     return std.mem.eql(u8, version, "2026-07-28");
+ }
+ 
+-fn writeUnsupportedProtocolVersionError(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, requested: []const u8) void {
++fn writeUnsupportedProtocolVersionError(alloc: std.mem.Allocator, rpc: RpcOut, id: ?std.json.Value, requested: []const u8) void {
+     var buf: std.ArrayList(u8) = .empty;
+     defer buf.deinit(alloc);
+     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+@@ -1560,17 +1597,14 @@ fn writeUnsupportedProtocolVersionError(alloc: std.mem.Allocator, stdout: cio.Fi
+     buf.appendSlice(alloc, ",\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"requested\":\"") catch return;
+     mcpj.writeEscaped(alloc, &buf, requested);
+     buf.appendSlice(alloc, "\",\"supported\":" ++ supported_versions_json ++ "}}}\n") catch return;
+-    stdout.writeAll(buf.items) catch {
+-        stdout_broken.store(true, .release);
+-        return;
+-    };
++    rpc.send(buf.items);
+ }
+ 
+ fn requestRoots(s: *Session) void {
+     const rid = s.next_id;
+     s.next_id += 1;
+     s.pending_roots_id = rid;
+-    writeRequest(s.alloc, s.stdout, rid, "roots/list", "{}");
++    writeRequest(s.alloc, s.rpc, rid, "roots/list", "{}");
+ }
+ 
+ fn handleResponse(io: std.Io, s: *Session, root: *const std.json.ObjectMap) void {
+@@ -1627,7 +1661,7 @@ fn parseRoots(io: std.Io, s: *Session, result: *const std.json.ObjectMap) void {
+     }
+ }
+ 
+-fn writeRequest(alloc: std.mem.Allocator, stdout: cio.File, id: i64, method: []const u8, params: []const u8) void {
++fn writeRequest(alloc: std.mem.Allocator, rpc: RpcOut, id: i64, method: []const u8, params: []const u8) void {
+     var buf: std.ArrayList(u8) = .empty;
+     defer buf.deinit(alloc);
+     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+@@ -1639,17 +1673,14 @@ fn writeRequest(alloc: std.mem.Allocator, stdout: cio.File, id: i64, method: []c
+     buf.appendSlice(alloc, "\",\"params\":") catch return;
+     buf.appendSlice(alloc, params) catch return;
+     buf.appendSlice(alloc, "}\n") catch return;
+-    stdout.writeAll(buf.items) catch {
+-        stdout_broken.store(true, .release);
+-        return;
+-    };
++    rpc.send(buf.items);
+ }
+ 
+ fn handleCall(
+     io: std.Io,
+     alloc: std.mem.Allocator,
+     root: *const std.json.ObjectMap,
+-    stdout: cio.File,
++    rpc: RpcOut,
+     id: ?std.json.Value,
+     store: *Store,
+     explorer: *Explorer,
+@@ -1665,24 +1696,24 @@ fn handleCall(
+     const is_notification = id == null;
+ 
+     const params_val = root.get("params") orelse {
+-        if (!is_notification) writeError(alloc, stdout, id, -32602, "Missing params");
++        if (!is_notification) writeError(alloc, rpc, id, -32602, "Missing params");
+         return;
+     };
+     if (params_val != .object) {
+-        if (!is_notification) writeError(alloc, stdout, id, -32602, "params must be object");
++        if (!is_notification) writeError(alloc, rpc, id, -32602, "params must be object");
+         return;
+     }
+     const params = &params_val.object;
+ 
+     const name = getStr(params, "name") orelse {
+-        if (!is_notification) writeError(alloc, stdout, id, -32602, "Missing tool name");
++        if (!is_notification) writeError(alloc, rpc, id, -32602, "Missing tool name");
+         return;
+     };
+     var args_value: std.json.Value = .{ .object = .empty };
+     var inline_args: std.json.ObjectMap = .empty;
+     defer inline_args.deinit(alloc);
+     const args = selectDirectCallArgs(alloc, params, &args_value, &inline_args) catch |err| {
+-        if (!is_notification) writeError(alloc, stdout, id, -32602, switch (err) {
++        if (!is_notification) writeError(alloc, rpc, id, -32602, switch (err) {
+             error.ArgumentsMustBeObject => "arguments must be object",
+             error.ArgsMustBeObject => "args must be object",
+             error.OutOfMemory => "out of memory",
+@@ -1691,7 +1722,7 @@ fn handleCall(
+     };
+ 
+     const tool = std.meta.stringToEnum(Tool, name) orelse {
+-        if (!is_notification) writeError(alloc, stdout, id, -32602, "Unknown tool");
++        if (!is_notification) writeError(alloc, rpc, id, -32602, "Unknown tool");
+         return;
+     };
+ 
+@@ -1701,12 +1732,12 @@ fn handleCall(
+             ds.query_requested.store(true, .release);
+             _ = triggerDeferredScanWithFallback(ds, roots, ds.fallback_cwd);
+             if (!ds.triggered.load(.acquire)) {
+-                if (!is_notification) writeError(alloc, stdout, id, -32000, "No indexable root; send workspace roots or pass an explicit project.");
++                if (!is_notification) writeError(alloc, rpc, id, -32000, "No indexable root; send workspace roots or pass an explicit project.");
+                 return;
+             }
+             waitForScanReady(30_000);
+             if (getScanState() != .ready) {
+-                if (!is_notification) writeError(alloc, stdout, id, -32000, "Index is still starting; retry the tool request.");
++                if (!is_notification) writeError(alloc, rpc, id, -32000, "Index is still starting; retry the tool request.");
+                 return;
+             }
+         }
+@@ -1791,7 +1822,7 @@ fn handleCall(
+     var result: std.ArrayList(u8) = .empty;
+     defer result.deinit(alloc);
+     if (!assembleMcpContentEnvelope(alloc, summary.items, out.items, guidance.items, is_error, &result)) return;
+-    writeResultVersioned(alloc, stdout, id, result.items, modern_results);
++    writeResultVersioned(alloc, rpc, id, result.items, modern_results);
+ }
+ 
+ fn isDirectCallAdminKey(key: []const u8) bool {
+@@ -7243,21 +7274,18 @@ pub fn assembleJsonRpcResultVersioned(alloc: std.mem.Allocator, id: ?std.json.Va
+     return true;
+ }
+ 
+-fn writeResult(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, result: []const u8) void {
+-    writeResultVersioned(alloc, stdout, id, result, true);
++fn writeResult(alloc: std.mem.Allocator, rpc: RpcOut, id: ?std.json.Value, result: []const u8) void {
++    writeResultVersioned(alloc, rpc, id, result, true);
+ }
+ 
+-fn writeResultVersioned(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, result: []const u8, modern_results: bool) void {
++fn writeResultVersioned(alloc: std.mem.Allocator, rpc: RpcOut, id: ?std.json.Value, result: []const u8, modern_results: bool) void {
+     var buf: std.ArrayList(u8) = .empty;
+     defer buf.deinit(alloc);
+     if (!assembleJsonRpcResultVersioned(alloc, id, result, &buf, modern_results)) return;
+-    stdout.writeAll(buf.items) catch {
+-        stdout_broken.store(true, .release);
+-        return;
+-    };
++    rpc.send(buf.items);
+ }
+ 
+-fn writeError(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, code: i32, msg: []const u8) void {
++fn writeError(alloc: std.mem.Allocator, rpc: RpcOut, id: ?std.json.Value, code: i32, msg: []const u8) void {
+     var buf: std.ArrayList(u8) = .empty;
+     defer buf.deinit(alloc);
+     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+@@ -7268,15 +7296,8 @@ fn writeError(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, c
+     buf.appendSlice(alloc, cs) catch return;
+     buf.appendSlice(alloc, ",\"message\":\"") catch return;
+     mcpj.writeEscaped(alloc, &buf, msg);
+-    buf.appendSlice(alloc, "\"}}") catch return;
+-    stdout.writeAll(buf.items) catch {
+-        stdout_broken.store(true, .release);
+-        return;
+-    };
+-    stdout.writeAll("\n") catch {
+-        stdout_broken.store(true, .release);
+-        return;
+-    };
++    buf.appendSlice(alloc, "\"}}\n") catch return;
++    rpc.send(buf.items);
+ }
+ /// Fast JSON string escaper: batch-copies runs of safe characters via
+ /// appendSlice instead of the per-byte append in mcpj.writeEscaped.
+@@ -8005,6 +8026,27 @@ test "issue-353: project cache invalidation reloads newly written snapshots" {
+     try testing.expect(new_ctx.explorer.outlines.contains("src/new.zig"));
+ }
+ 
++test "project cache: a project naming the fixed default root uses the default index" {
++    const io = testing.io;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
++    const root = root_buf[0..try tmp.dir.realPathFile(io, ".", &root_buf)];
++
++    var default_explorer = Explorer.init(testing.allocator, explore_mod.Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
++    defer default_explorer.deinit();
++    try default_explorer.setRoot(io, root);
++    var default_store = Store.init(testing.allocator);
++    defer default_store.deinit();
++
++    var cache = ProjectCache.init(testing.allocator, root, explore_mod.Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
++    defer cache.deinit();
++    cache.default_root_fixed = true;
++    const ctx = try cache.get(io, root, &default_explorer, &default_store);
++    try testing.expect(ctx.explorer == &default_explorer);
++    try testing.expect(ctx.store == &default_store);
++}
++
+ test "codedb_snapshot cache reuses output until store seq changes" {
+     const io = testing.io;
+     const alloc = testing.allocator;
+diff --git a/src/mcp_shared.zig b/src/mcp_shared.zig
+new file mode 100644
+index 0000000..538c3d3
+--- /dev/null
++++ b/src/mcp_shared.zig
+@@ -0,0 +1,676 @@
++//! One index per project root. `codedb mcp` forwards its stdio to a shared
++//! `codedb <root> mcp-server` over a unix socket, so N agent sessions on one
++//! root hold one Explorer instead of N. When the shared server cannot be
++//! reached, `forward` returns null and the caller serves in-process.
++const std = @import("std");
++const builtin = @import("builtin");
++const cio = @import("cio.zig");
++const release_info = @import("release_info.zig");
++const Config = @import("config.zig").Config;
++const cli_proxy = @import("cli_proxy.zig");
++
++pub const supported = builtin.os.tag == .macos or builtin.os.tag == .linux;
++
++const hello_prefix = "codedb-mcp-shared/1 ";
++const ready_reply = "ready";
++const mismatch_reply = "mismatch";
++const default_idle_ms: i64 = 5 * 60 * 1000;
++/// Bounds spawning a server and seeing it listen. A slow index load is
++/// covered by `ready_timeout_ms` instead, while the connection stays open.
++const connect_timeout_ms: i64 = 10 * 1000;
++/// MCP clients give up on server startup after about 30 s (Codex default).
++const ready_timeout_ms: i64 = 30 * 1000;
++/// The fd number the spawned server finds its inherited lock on.
++const inherited_lock_fd: c_int = 3;
++const listen_backlog = 128;
++/// A connected peer that sends no hello in this time holds no session slot.
++const hello_timeout_ms: i64 = 10 * 1000;
++
++/// Knobs that choose the endpoint or the server lifetime, not what a session
++/// returns, so clients that differ only in these still share one server.
++const env_not_in_key = [_][]const u8{
++    "CODEDB_MCP_SHARED",
++    "CODEDB_MCP_SOCKET_DIR",
++    "CODEDB_MCP_IDLE_MS",
++    "CODEDB_ROOT",
++};
++
++/// Order-independent hash of the CODEDB_* entries of `env` ("NAME=VALUE").
++pub fn envFingerprint(env: []const []const u8) u64 {
++    var sum: u64 = 0;
++    for (env) |entry| sum +%= envEntryHash(entry);
++    return sum;
++}
++
++fn envEntryHash(entry: []const u8) u64 {
++    if (!std.mem.startsWith(u8, entry, "CODEDB_")) return 0;
++    const name = entry[0 .. std.mem.indexOfScalar(u8, entry, '=') orelse entry.len];
++    for (env_not_in_key) |skip| {
++        if (std.mem.eql(u8, name, skip)) return 0;
++    }
++    return std.hash.Wyhash.hash(0x636f646564620001, entry);
++}
++
++fn processEnvFingerprint() u64 {
++    var sum: u64 = 0;
++    var it = cio.environ();
++    while (it[0]) |entry| : (it += 1) sum +%= envEntryHash(std.mem.span(entry));
++    return sum;
++}
++
++/// Clients share a server only when they would run identical in-process
++/// servers: same binary, root, effective config and CODEDB_* environment.
++pub fn serverKey(abs_root: []const u8, cfg: Config, no_telemetry: bool, env_fingerprint: u64) u64 {
++    var h = std.hash.Wyhash.init(0);
++    h.update(hello_prefix);
++    h.update(release_info.semver);
++    h.update(&.{0});
++    h.update(abs_root);
++    h.update(&.{0});
++    const max_versions: u64 = cfg.max_versions;
++    h.update(std.mem.asBytes(&max_versions));
++    h.update(std.mem.asBytes(&cfg.max_cached));
++    h.update(std.mem.asBytes(&cfg.max_watched));
++    h.update(&.{ @intFromBool(cfg.rerank_trace), @intFromBool(no_telemetry) });
++    h.update(std.mem.asBytes(&env_fingerprint));
++    return h.final();
++}
++
++fn helloLine(buf: []u8, key: u64) []const u8 {
++    return std.fmt.bufPrint(buf, hello_prefix ++ "{x:0>16}", .{key}) catch unreachable;
++}
++
++/// `<dir>/<key>.{sock,lock,log}`: the socket, the flock that admits one
++/// server per key, and that server's stderr.
++pub const Endpoint = struct {
++    key: u64,
++    dir_buf: [std.fs.max_path_bytes]u8 = undefined,
++    dir_len: usize = 0,
++
++    pub fn init(io: std.Io, key: u64) Unavailable!Endpoint {
++        var ep = Endpoint{ .key = key };
++        const dir = socketDir(&ep.dir_buf) orelse return error.NoSocketDir;
++        ep.dir_len = dir.len;
++        var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
++        const sock = ep.path(&sock_buf, "sock") orelse return error.SocketPathTooLong;
++        // sockaddr_un holds 104 bytes on macOS, 108 on Linux.
++        _ = cli_proxy.cliFillSockaddr(sock) orelse return error.SocketPathTooLong;
++        if (std.fs.path.dirname(dir)) |parent| std.Io.Dir.cwd().createDirPath(io, parent) catch {};
++        var dir_z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
++        const dir_z = cio.bufPrintZ(&dir_z_buf, "{s}", .{dir}) catch return error.NoSocketDir;
++        _ = std.c.mkdir(dir_z.ptr, 0o700);
++        // Anyone else who can write here could plant <key>.log as a symlink
++        // and have the spawn truncate its target.
++        try checkDirPrivate(dir_z);
++        return ep;
++    }
++
++    pub fn path(self: *const Endpoint, buf: []u8, ext: []const u8) ?[:0]const u8 {
++        return cio.bufPrintZ(buf, "{s}/{x:0>16}.{s}", .{ self.dir_buf[0..self.dir_len], self.key, ext }) catch null;
++    }
++};
++
++/// Why a client serves in-process; logged so a fallback is never silent.
++const Unavailable = error{
++    NoSocketDir,
++    SocketDirUnsafe,
++    SocketPathTooLong,
++    SocketDirNotWritable,
++    ServerRefused,
++    SpawnFailed,
++    ServerExitedBeforeListening,
++    ConnectTimeout,
++};
++
++/// A real directory (not a symlink) that we own and no one else can write.
++fn checkDirPrivate(dir_z: [:0]const u8) Unavailable!void {
++    const fd = std.c.open(dir_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, @as(c_uint, 0));
++    if (fd < 0) return switch (std.c.errno(fd)) {
++        .LOOP, .NOTDIR => error.SocketDirUnsafe,
++        else => error.NoSocketDir,
++    };
++    defer _ = std.c.close(fd);
++    const owner = fdOwnerMode(fd) orelse return error.NoSocketDir;
++    if (owner.uid != std.c.getuid() or (owner.mode & 0o022) != 0) return error.SocketDirUnsafe;
++}
++
++fn fdOwnerMode(fd: c_int) ?struct { uid: std.c.uid_t, mode: u32 } {
++    if (comptime builtin.os.tag == .linux) {
++        // Zig's libc bindings have no fstat on Linux; AT_EMPTY_PATH stats the fd itself.
++        var stx: std.os.linux.Statx = undefined;
++        if (std.c.statx(fd, "", 0x1000, .{ .MODE = true, .UID = true }, &stx) != 0) return null;
++        return .{ .uid = stx.uid, .mode = stx.mode };
++    }
++    var st: std.c.Stat = undefined;
++    if (std.c.fstat(fd, &st) != 0) return null;
++    return .{ .uid = st.uid, .mode = st.mode };
++}
++
++fn socketDir(buf: []u8) ?[]const u8 {
++    if (cio.posixGetenv("CODEDB_MCP_SOCKET_DIR")) |dir| {
++        if (dir.len > 0) return std.fmt.bufPrint(buf, "{s}", .{dir}) catch null;
++    }
++    const home = cio.homeDir() orelse return null;
++    return std.fmt.bufPrint(buf, "{s}/.codedb/run", .{home}) catch null;
++}
++
++const LockAttempt = union(enum) {
++    acquired: c_int,
++    held,
++    unavailable,
++};
++
++fn lockServer(lock_path: [:0]const u8) LockAttempt {
++    const fd = std.c.open(lock_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .CLOEXEC = true }, @as(c_uint, 0o600));
++    if (fd < 0) return .unavailable;
++    if (std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB) != 0) {
++        _ = std.c.close(fd);
++        return .held;
++    }
++    return .{ .acquired = fd };
++}
++
++// ── Client side ────────────────────────────────────────────────────────────
++
++/// Serve this stdio session through the shared server for `abs_root`,
++/// spawning it when none runs. Returns the exit code once the session ends,
++/// or null before any stdin byte is consumed so the caller can serve in-process.
++pub fn forward(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8, cfg: Config, no_telemetry: bool, config_file: ?[]const u8) ?u8 {
++    if (comptime !supported) return null;
++    if (cio.posixGetenv("CODEDB_MCP_SHARED")) |v| {
++        if (std.mem.eql(u8, v, "0")) return null;
++    }
++    const key = serverKey(abs_root, cfg, no_telemetry, processEnvFingerprint());
++    const spawn = SpawnArgs{ .io = io, .allocator = allocator, .abs_root = abs_root, .no_telemetry = no_telemetry, .config_file = config_file };
++    const conn = connectOrSpawn(io, key, spawn) catch |err| {
++        std.log.info("codedb mcp: shared server unavailable ({s}), serving in-process", .{@errorName(err)});
++        return null;
++    };
++    return pump(conn);
++}
++
++const SpawnArgs = struct {
++    io: std.Io,
++    allocator: std.mem.Allocator,
++    abs_root: []const u8,
++    no_telemetry: bool,
++    config_file: ?[]const u8,
++};
++
++fn connectOrSpawn(io: std.Io, key: u64, spawn: SpawnArgs) Unavailable!c_int {
++    const ep = try Endpoint.init(io, key);
++    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
++    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
++    var log_buf: [std.fs.max_path_bytes]u8 = undefined;
++    const sock = ep.path(&sock_buf, "sock") orelse return error.SocketPathTooLong;
++    const lock = ep.path(&lock_buf, "lock") orelse return error.SocketPathTooLong;
++    const log = ep.path(&log_buf, "log") orelse return error.SocketPathTooLong;
++
++    const deadline = cio.milliTimestamp() + connect_timeout_ms;
++    var spawned = false;
++    var backoff_ms: u64 = 5;
++    while (cio.milliTimestamp() < deadline) {
++        switch (attach(sock, key)) {
++            .ready => |fd| return fd,
++            .refused => return error.ServerRefused,
++            .absent => {},
++        }
++        switch (lockServer(lock)) {
++            .unavailable => return error.SocketDirNotWritable,
++            .held => {},
++            .acquired => |lock_fd| {
++                defer _ = std.c.close(lock_fd);
++                // The lock is free again only if the server we started died.
++                if (spawned) return error.ServerExitedBeforeListening;
++                if (!spawnServer(spawn, key, lock_fd, log)) return error.SpawnFailed;
++                spawned = true;
++            },
++        }
++        cio.sleepMs(backoff_ms);
++        backoff_ms = @min(backoff_ms * 2, 50);
++    }
++    return error.ConnectTimeout;
++}
++
++const Attach = union(enum) {
++    /// Greeted by a server that has loaded its index.
++    ready: c_int,
++    /// Nothing listens yet, or the server closed before greeting us.
++    absent,
++    /// A live peer that is not, or will not be, our server.
++    refused,
++};
++
++fn attach(sock: [:0]const u8, key: u64) Attach {
++    var sa = cli_proxy.cliFillSockaddr(sock) orelse return .refused;
++    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
++    if (fd < 0) return .absent;
++    if (std.c.connect(fd, @ptrCast(&sa.addr), sa.len) != 0) {
++        _ = std.c.close(fd);
++        return .absent;
++    }
++    if (!cli_proxy.unixPeerTrusted(fd)) {
++        _ = std.c.close(fd);
++        return .refused;
++    }
++    var hello_buf: [64]u8 = undefined;
++    var reply_buf: [64]u8 = undefined;
++    const reply = if (writeLine(fd, helloLine(&hello_buf, key))) readLine(fd, &reply_buf, cio.milliTimestamp() + ready_timeout_ms) else .closed;
++    switch (reply) {
++        .line => |line| if (std.mem.eql(u8, line, ready_reply)) return .{ .ready = fd },
++        .closed => {
++            _ = std.c.close(fd);
++            return .absent;
++        },
++        .timeout => {},
++    }
++    _ = std.c.close(fd);
++    return .refused;
++}
++
++const LineRead = union(enum) { line: []const u8, closed, timeout };
++
++/// Reads one short line byte by byte, so no MCP bytes after it are consumed.
++fn readLine(fd: c_int, buf: []u8, deadline_ms: i64) LineRead {
++    var len: usize = 0;
++    while (len < buf.len) {
++        const wait_ms = deadline_ms - cio.milliTimestamp();
++        if (wait_ms <= 0) return .timeout;
++        var fds = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
++        const ready = std.c.poll(&fds, 1, @intCast(@min(wait_ms, std.math.maxInt(c_int))));
++        if (ready < 0) {
++            if (std.c.errno(ready) == .INTR) continue;
++            return .closed;
++        }
++        if (ready == 0) return .timeout;
++        const n = cli_proxy.connRead(fd, buf[len .. len + 1]) orelse return .closed;
++        if (n == 0) return .closed;
++        if (buf[len] == '\n') return .{ .line = buf[0..len] };
++        len += 1;
++    }
++    return .closed;
++}
++
++fn writeLine(fd: c_int, line: []const u8) bool {
++    return cli_proxy.cliWriteFull(fd, line) and cli_proxy.cliWriteFull(fd, "\n");
++}
++
++/// Copies stdin to the server and the server to stdout until the session ends.
++fn pump(conn: c_int) u8 {
++    var stdin_done = std.atomic.Value(bool).init(false);
++    const upstream = std.Thread.spawn(.{}, copyStdinToServer, .{ conn, &stdin_done }) catch {
++        _ = std.c.close(conn);
++        return 1;
++    };
++    upstream.detach();
++    var buf: [64 * 1024]u8 = undefined;
++    while (true) {
++        const n = cli_proxy.connRead(conn, &buf) orelse break;
++        if (n == 0) break;
++        cio.File.stdout().writeAll(buf[0..n]) catch return 0;
++    }
++    if (stdin_done.load(.acquire)) return 0;
++    std.log.err("codedb mcp: lost the shared server connection", .{});
++    return 1;
++}
++
++fn copyStdinToServer(conn: c_int, stdin_done: *std.atomic.Value(bool)) void {
++    var buf: [64 * 1024]u8 = undefined;
++    while (true) {
++        const n = cli_proxy.connRead(0, &buf) orelse break;
++        if (n == 0 or !cli_proxy.cliWriteFull(conn, buf[0..n])) break;
++    }
++    stdin_done.store(true, .release);
++    _ = std.c.shutdown(conn, std.c.SHUT.WR);
++}
++
++/// Double-forks `codedb <root> mcp-server` so it is reparented to init and
++/// outlives this client, and hands it `lock_fd` as fd 3 so it owns the key.
++fn spawnServer(spawn: SpawnArgs, key: u64, lock_fd: c_int, log_path: [:0]const u8) bool {
++    const self_exe = std.process.executablePathAlloc(spawn.io, spawn.allocator) catch return false;
++    defer spawn.allocator.free(self_exe);
++    const root_z = spawn.allocator.dupeSentinel(u8, spawn.abs_root, 0) catch return false;
++    defer spawn.allocator.free(root_z);
++    var config_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
++    var key_buf: [32]u8 = undefined;
++    const key_arg = cio.bufPrintZ(&key_buf, "--key={x:0>16}", .{key}) catch return false;
++    var argv: [8:null]?[*:0]const u8 = @splat(null);
++    var argc: usize = 0;
++    for ([_][*:0]const u8{ self_exe.ptr, root_z.ptr, "mcp-server", "--lock-fd=3", key_arg.ptr }) |arg| {
++        argv[argc] = arg;
++        argc += 1;
++    }
++    if (spawn.no_telemetry) {
++        argv[argc] = "--no-telemetry";
++        argc += 1;
++    }
++    if (spawn.config_file) |config_file| {
++        const arg = cio.bufPrintZ(&config_buf, "--config-file={s}", .{config_file}) catch return false;
++        argv[argc] = arg.ptr;
++        argc += 1;
++    }
++
++    const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, @as(c_uint, 0));
++    if (devnull < 0) return false;
++    defer _ = std.c.close(devnull);
++    const log_fd = std.c.open(log_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true, .CLOEXEC = true }, @as(c_uint, 0o600));
++    defer if (log_fd >= 0) {
++        _ = std.c.close(log_fd);
++    };
++    const envp = cio.environ();
++    // Any fd below the soft limit may be an agent's inheritable pipe.
++    const fd_bound: c_int = if (std.posix.getrlimit(.NOFILE)) |lim| @intCast(@min(lim.cur, 1 << 20)) else |_| 1 << 16;
++
++    const pid = std.c.fork();
++    if (pid < 0) return false;
++    if (pid == 0) daemonize(self_exe.ptr, &argv, envp, devnull, if (log_fd >= 0) log_fd else devnull, lock_fd, fd_bound);
++    var status: c_int = 0;
++    while (true) {
++        const rc = std.c.waitpid(pid, &status, 0);
++        if (rc >= 0) break;
++        if (std.c.errno(rc) != .INTR) return false;
++    }
++    return status == 0;
++}
++
++/// Runs in the forked child: only async-signal-safe calls until execve.
++fn daemonize(exe: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, devnull: c_int, log_fd: c_int, lock_fd: c_int, fd_bound: c_int) noreturn {
++    _ = std.c.setsid();
++    const pid = std.c.fork();
++    if (pid != 0) std.c._exit(if (pid > 0) 0 else 1);
++    // Lift every fd above the targets first so no dup2 clobbers a source.
++    const high_null = std.c.fcntl(devnull, std.c.F.DUPFD_CLOEXEC, @as(c_int, 10));
++    const high_log = std.c.fcntl(log_fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 10));
++    const high_lock = std.c.fcntl(lock_fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 10));
++    if (high_null < 0 or high_log < 0 or high_lock < 0) std.c._exit(1);
++    _ = std.c.dup2(high_null, 0);
++    _ = std.c.dup2(high_null, 1);
++    _ = std.c.dup2(high_log, 2);
++    _ = std.c.dup2(high_lock, inherited_lock_fd);
++    // The server must not keep an agent's pipes, or that agent never sees EOF.
++    var fd: c_int = inherited_lock_fd + 1;
++    while (fd < fd_bound) : (fd += 1) _ = std.c.close(fd);
++    _ = std.c.execve(exe, argv, envp);
++    std.c._exit(127);
++}
++
++// ── Server side ────────────────────────────────────────────────────────────
++
++pub fn idleMsFromEnv() i64 {
++    const raw = cio.posixGetenv("CODEDB_MCP_IDLE_MS") orelse return default_idle_ms;
++    return std.fmt.parseInt(i64, raw, 10) catch default_idle_ms;
++}
++
++/// `--lock-fd=N` from the spawning client, if present among `args`.
++pub fn inheritedLockFd(args: []const []const u8) ?c_int {
++    const raw = flagValue(args, "--lock-fd=") orelse return null;
++    return std.fmt.parseInt(c_int, raw, 10) catch null;
++}
++
++/// `--key=HEX`: the key the spawning client waits on.
++pub fn spawnedKey(args: []const []const u8) ?u64 {
++    const raw = flagValue(args, "--key=") orelse return null;
++    return std.fmt.parseInt(u64, raw, 16) catch null;
++}
++
++fn flagValue(args: []const []const u8, prefix: []const u8) ?[]const u8 {
++    for (args) |arg| {
++        if (std.mem.startsWith(u8, arg, prefix)) return arg[prefix.len..];
++    }
++    return null;
++}
++
++/// The listening side of one key. It holds the key's flock for its whole
++/// life, so it alone may unlink and bind the socket path.
++pub const Server = struct {
++    key: u64,
++    listen_fd: c_int,
++    lock_fd: c_int,
++    sock_buf: [std.fs.max_path_bytes]u8 = undefined,
++    sock_len: usize = 0,
++    idle_ms: i64,
++    mu: cio.Mutex = .{},
++    active: usize = 0,
++    idle_since_ms: i64,
++
++    /// Null when another server owns the key or the socket cannot be bound;
++    /// the caller then exits without loading anything.
++    pub fn bind(io: std.Io, abs_root: []const u8, cfg: Config, no_telemetry: bool, inherited_lock: ?c_int, expected_key: ?u64, idle_ms: i64) ?Server {
++        if (comptime !supported) return null;
++        const key = serverKey(abs_root, cfg, no_telemetry, processEnvFingerprint());
++        // Serving another key would leave the spawning client waiting on a
++        // socket nobody binds; exiting frees its lock so it falls back at once.
++        if (expected_key) |want| if (want != key) {
++            std.log.warn("codedb mcp-server: key {x:0>16} differs from the client's {x:0>16}; exiting", .{ key, want });
++            return null;
++        };
++        const ep = Endpoint.init(io, key) catch return null;
++        var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
++        const lock_path = ep.path(&lock_buf, "lock") orelse return null;
++        const lock_fd = inherited_lock orelse switch (lockServer(lock_path)) {
++            .acquired => |fd| fd,
++            .held, .unavailable => return null,
++        };
++        if (std.c.flock(lock_fd, std.c.LOCK.EX | std.c.LOCK.NB) != 0) return null;
++        _ = std.c.fcntl(lock_fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
++
++        var server = Server{ .key = key, .listen_fd = -1, .lock_fd = lock_fd, .idle_ms = idle_ms, .idle_since_ms = cio.milliTimestamp() };
++        const sock = ep.path(&server.sock_buf, "sock") orelse return null;
++        server.sock_len = sock.len;
++        const sa = cli_proxy.cliFillSockaddr(sock) orelse return null;
++        _ = std.c.unlink(sock.ptr);
++        server.listen_fd = cli_proxy.cliBindListen(sa, sock, listen_backlog) orelse return null;
++        _ = std.c.fcntl(server.listen_fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
++        std.log.info("codedb mcp-server: root={s} socket={s} idle_ms={d}", .{ abs_root, sock, idle_ms });
++        return server;
++    }
++
++    fn sockPath(self: *const Server) [:0]const u8 {
++        return self.sock_buf[0..self.sock_len :0];
++    }
++
++    /// Accepts clients until no session has been open for `idle_ms`, then
++    /// unlinks the socket and returns. `handler.runSession(fd)` runs per client.
++    /// Admission and the idle verdict share this thread, so a client accepted
++    /// before the verdict always keeps the server alive.
++    pub fn serve(self: *Server, handler: anytype) void {
++        if (comptime !supported) return;
++        // The index load ran before this; clients queued during it count as new.
++        self.mu.lock();
++        self.idle_since_ms = cio.milliTimestamp();
++        self.mu.unlock();
++        while (!self.idleExpired(cio.milliTimestamp())) {
++            var fds = [_]std.c.pollfd{.{ .fd = self.listen_fd, .events = std.c.POLL.IN, .revents = 0 }};
++            if (std.c.poll(&fds, 1, 250) <= 0) continue;
++            const conn = std.c.accept(self.listen_fd, null, null);
++            if (conn < 0) continue;
++            _ = std.c.fcntl(conn, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
++            if (!cli_proxy.unixPeerTrusted(conn)) {
++                _ = std.c.close(conn);
++                continue;
++            }
++            self.enter();
++            const thread = std.Thread.spawn(.{}, runClient, .{ self, conn, handler }) catch {
++                self.leave(conn);
++                continue;
++            };
++            thread.detach();
++        }
++        _ = std.c.unlink(self.sockPath().ptr);
++        _ = std.c.close(self.listen_fd);
++        // A newer client may start the next server while this one shuts down.
++        _ = std.c.close(self.lock_fd);
++        self.lock_fd = -1;
++        std.log.info("codedb mcp-server: idle for {d}ms with no clients, exiting", .{self.idle_ms});
++    }
++
++    fn runClient(self: *Server, conn: c_int, handler: anytype) void {
++        defer self.leave(conn);
++        if (!self.greet(conn)) return;
++        handler.runSession(conn);
++    }
++
++    fn greet(self: *const Server, conn: c_int) bool {
++        var expected_buf: [64]u8 = undefined;
++        var got_buf: [64]u8 = undefined;
++        const got = switch (readLine(conn, &got_buf, cio.milliTimestamp() + hello_timeout_ms)) {
++            .line => |line| line,
++            .closed, .timeout => return false,
++        };
++        if (!std.mem.eql(u8, got, helloLine(&expected_buf, self.key))) {
++            _ = writeLine(conn, mismatch_reply);
++            return false;
++        }
++        return writeLine(conn, ready_reply);
++    }
++
++    fn enter(self: *Server) void {
++        self.mu.lock();
++        defer self.mu.unlock();
++        self.active += 1;
++    }
++
++    fn leave(self: *Server, conn: c_int) void {
++        _ = std.c.close(conn);
++        self.mu.lock();
++        defer self.mu.unlock();
++        self.active -= 1;
++        if (self.active == 0) self.idle_since_ms = cio.milliTimestamp();
++    }
++
++    fn idleExpired(self: *Server, now_ms: i64) bool {
++        self.mu.lock();
++        defer self.mu.unlock();
++        return self.active == 0 and now_ms - self.idle_since_ms >= self.idle_ms;
++    }
++};
++
++// ── Tests ──────────────────────────────────────────────────────────────────
++
++const testing = std.testing;
++
++test "mcp shared: env fingerprint covers CODEDB_ knobs only" {
++    const base = envFingerprint(&.{ "PATH=/bin", "CODEDB_TOOLS_PROFILE=mini" });
++    try testing.expectEqual(base, envFingerprint(&.{ "CODEDB_TOOLS_PROFILE=mini", "PATH=/usr/bin", "TERM=xterm" }));
++    try testing.expect(base != envFingerprint(&.{"CODEDB_TOOLS_PROFILE=full"}));
++    try testing.expect(base != envFingerprint(&.{ "CODEDB_TOOLS_PROFILE=mini", "CODEDB_MCP_LEAN=1" }));
++    try testing.expectEqual(base, envFingerprint(&.{
++        "CODEDB_TOOLS_PROFILE=mini",
++        "CODEDB_MCP_SOCKET_DIR=/tmp/x",
++        "CODEDB_MCP_IDLE_MS=10",
++        "CODEDB_MCP_SHARED=1",
++        "CODEDB_ROOT=/elsewhere",
++    }));
++}
++
++test "mcp shared: server key separates roots, configs and telemetry" {
++    const cfg = Config.default;
++    const key = serverKey("/repo", cfg, false, 0);
++    try testing.expectEqual(key, serverKey("/repo", cfg, false, 0));
++    try testing.expect(key != serverKey("/repo2", cfg, false, 0));
++    try testing.expect(key != serverKey("/repo", cfg, true, 0));
++    try testing.expect(key != serverKey("/repo", cfg, false, 1));
++    var small = cfg;
++    small.max_cached = 8;
++    try testing.expect(key != serverKey("/repo", small, false, 0));
++}
++
++test "mcp shared: a socket path beyond sockaddr_un is refused, not truncated" {
++    if (comptime !supported) return error.SkipZigTest;
++    var threaded = std.Io.Threaded.init(testing.allocator, .{});
++    defer threaded.deinit();
++    const prev_dir = cio.posixGetenv("CODEDB_MCP_SOCKET_DIR");
++    defer if (prev_dir) |d| cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", d) else cio.posixUnsetenv("CODEDB_MCP_SOCKET_DIR");
++    const long_dir = "/nonexistent-codedb-test/" ++ @as([96]u8, @splat('d'));
++    cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", long_dir);
++    try testing.expectError(error.SocketPathTooLong, Endpoint.init(threaded.io(), 1));
++}
++
++test "mcp shared: a socket dir others can write is refused" {
++    if (comptime !supported) return error.SkipZigTest;
++    var threaded = std.Io.Threaded.init(testing.allocator, .{});
++    defer threaded.deinit();
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
++    const dir_len = try tmp.dir.realPath(threaded.io(), &dir_buf);
++    var run_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
++    const run_dir = try cio.bufPrintZ(&run_buf, "{s}/run", .{dir_buf[0..dir_len]});
++    try testing.expectEqual(@as(c_int, 0), std.c.mkdir(run_dir.ptr, 0o700));
++    _ = std.c.chmod(run_dir.ptr, 0o777);
++    const prev_dir = cio.posixGetenv("CODEDB_MCP_SOCKET_DIR");
++    defer if (prev_dir) |d| cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", d) else cio.posixUnsetenv("CODEDB_MCP_SOCKET_DIR");
++    cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", run_dir);
++    try testing.expectError(error.SocketDirUnsafe, Endpoint.init(threaded.io(), 1));
++    _ = std.c.chmod(run_dir.ptr, 0o700);
++    _ = try Endpoint.init(threaded.io(), 1);
++}
++
++test "mcp shared: lock fd argument parsing" {
++    try testing.expectEqual(@as(?c_int, 3), inheritedLockFd(&.{ "--no-telemetry", "--lock-fd=3" }));
++    try testing.expectEqual(@as(?c_int, null), inheritedLockFd(&.{"--lock-fd=x"}));
++    try testing.expectEqual(@as(?c_int, null), inheritedLockFd(&.{}));
++    try testing.expectEqual(@as(?u64, 0xab), spawnedKey(&.{ "--lock-fd=3", "--key=00000000000000ab" }));
++    try testing.expectEqual(@as(?u64, null), spawnedKey(&.{"--key=zz"}));
++}
++
++const EchoHandler = struct {
++    fn runSession(_: *const EchoHandler, conn: c_int) void {
++        var buf: [256]u8 = undefined;
++        while (cli_proxy.connRead(conn, &buf)) |n| {
++            if (n == 0 or !cli_proxy.cliWriteFull(conn, buf[0..n])) return;
++        }
++    }
++};
++
++fn serveEcho(server: *Server, returned: *std.atomic.Value(bool)) void {
++    const handler = EchoHandler{};
++    server.serve(&handler);
++    returned.store(true, .release);
++}
++
++test "mcp shared: server greets, serves, and retires once idle" {
++    if (comptime !supported) return error.SkipZigTest;
++    var threaded = std.Io.Threaded.init(testing.allocator, .{});
++    defer threaded.deinit();
++    const io = threaded.io();
++
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
++    const dir_len = try tmp.dir.realPath(io, &dir_buf);
++    var env_buf: [std.fs.max_path_bytes]u8 = undefined;
++    const prev_dir = cio.posixGetenv("CODEDB_MCP_SOCKET_DIR");
++    cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", try std.fmt.bufPrint(&env_buf, "{s}/run", .{dir_buf[0..dir_len]}));
++    defer if (prev_dir) |d| cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", d) else cio.posixUnsetenv("CODEDB_MCP_SOCKET_DIR");
++
++    var server = Server.bind(io, "/shared-test-root", Config.default, true, null, null, 300) orelse return error.TestUnexpectedResult;
++    try testing.expect(Server.bind(io, "/shared-test-root", Config.default, true, null, null, 300) == null);
++    try testing.expect(Server.bind(io, "/shared-test-root", Config.default, true, null, server.key +% 1, 300) == null);
++
++    var returned = std.atomic.Value(bool).init(false);
++    const serve_thread = try std.Thread.spawn(.{}, serveEcho, .{ &server, &returned });
++
++    const conn = switch (attach(server.sockPath(), server.key)) {
++        .ready => |fd| fd,
++        .absent, .refused => return error.TestUnexpectedResult,
++    };
++    try testing.expect(writeLine(conn, "ping"));
++    var echo_buf: [16]u8 = undefined;
++    try testing.expectEqualStrings("ping", switch (readLine(conn, &echo_buf, cio.milliTimestamp() + 5000)) {
++        .line => |line| line,
++        .closed, .timeout => return error.TestUnexpectedResult,
++    });
++    try testing.expect(attach(server.sockPath(), server.key +% 1) == .refused);
++
++    cio.sleepMs(900);
++    try testing.expect(!returned.load(.acquire));
++    _ = std.c.close(conn);
++
++    serve_thread.join();
++    try testing.expect(attach(server.sockPath(), server.key) == .absent);
++    // serve released the key, so the next server can take it at once.
++    const next = Server.bind(io, "/shared-test-root", Config.default, true, null, null, 300) orelse return error.TestUnexpectedResult;
++    _ = std.c.close(next.listen_fd);
++    _ = std.c.close(next.lock_fd);
++}
+diff --git a/src/test_mcp.zig b/src/test_mcp.zig
+index 1ea716c..c62bf61 100644
+--- a/src/test_mcp.zig
++++ b/src/test_mcp.zig
+@@ -33,6 +33,7 @@ const commands_mod = @import("commands.zig");
+ const mcp_json = @import("mcp_json.zig");
+ comptime {
+     _ = @import("config.zig");
++    _ = @import("mcp_shared.zig");
+ }
+ 
+ fn setTestProjectRoot(explorer: *Explorer) !void {
+@@ -4926,3 +4927,67 @@ test "OpenWispr: callers excludes Swift declarations, locals, and parameter labe
+     try testing.expect(std.mem.indexOf(u8, out.items, "calls.swift:5") != null);
+     try testing.expect(std.mem.indexOf(u8, out.items, "calls.swift:6") != null);
+ }
++
++const PeerCtx = struct {
++    store: *Store,
++    explorer: *Explorer,
++    agents: *AgentRegistry,
++    telem: *telemetry_mod.Telemetry,
++    shutdown: *std.atomic.Value(bool),
++};
++
++fn runTestPeer(ctx: PeerCtx, conn: c_int) void {
++    defer _ = std.c.close(conn);
++    var broken = std.atomic.Value(bool).init(false);
++    const in: std.Io.File = .{ .handle = conn, .flags = .{ .nonblocking = false } };
++    const rpc: mcp_mod.RpcOut = .{ .file = .{ .handle = conn }, .broken = &broken };
++    mcp_mod.runPeer(io, testing.allocator, in, rpc, ctx.store, ctx.explorer, ctx.agents, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY, ctx.telem, null, ctx.shutdown);
++}
++
++test "mcp shared: concurrent peer sessions keep their own ids and broken state" {
++    cio.ignoreSigpipe();
++    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
++    defer explorer.deinit();
++    var store = Store.init(testing.allocator);
++    defer store.deinit();
++    var agents = AgentRegistry.init(testing.allocator);
++    defer agents.deinit();
++    _ = try agents.register("__filesystem__");
++    var telem = telemetry_mod.Telemetry.init(io, "/tmp", testing.allocator, true);
++    defer telem.deinit();
++    var shutdown = std.atomic.Value(bool).init(false);
++    const ctx = PeerCtx{ .store = &store, .explorer = &explorer, .agents = &agents, .telem = &telem, .shutdown = &shutdown };
++
++    var a: [2]std.c.fd_t = undefined;
++    var b: [2]std.c.fd_t = undefined;
++    try testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &a));
++    try testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &b));
++    const peer_a = try std.Thread.spawn(.{}, runTestPeer, .{ ctx, a[1] });
++    const peer_b = try std.Thread.spawn(.{}, runTestPeer, .{ ctx, b[1] });
++
++    const init_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}\n";
++    // Client B leaves before its reply, so the server's write to B fails.
++    try testing.expect(cli_proxy_mod.cliWriteFull(b[0], init_req));
++    _ = std.c.close(b[0]);
++    peer_b.join();
++
++    try testing.expect(cli_proxy_mod.cliWriteFull(a[0], init_req ++
++        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n" ++
++        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n" ++
++        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n"));
++    _ = std.c.shutdown(a[0], std.c.SHUT.WR);
++    var got: std.ArrayList(u8) = .empty;
++    defer got.deinit(testing.allocator);
++    var buf: [16 * 1024]u8 = undefined;
++    while (cli_proxy_mod.connRead(a[0], &buf)) |n| {
++        if (n == 0) break;
++        try got.appendSlice(testing.allocator, buf[0..n]);
++    }
++    _ = std.c.close(a[0]);
++    peer_a.join();
++
++    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, got.items, "\n"));
++    try testing.expect(std.mem.indexOf(u8, got.items, "\"serverInfo\"") != null);
++    try testing.expect(std.mem.indexOf(u8, got.items, "\"codedb_context\"") != null);
++    try testing.expect(!mcp_mod.stdout_broken.load(.acquire));
++}

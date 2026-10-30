@@ -1,0 +1,619 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alfred Ben <e0958604@u.nus.edu>
+Date: Fri, 30 Oct 2026 17:24:00 +0800
+Subject: [PATCH 1/5] explore, watcher: bound memory growth in long sessions
+
+Long agent sessions grew the server without bound: the call graph build
+held every file at once, every git HEAD change re-indexed the whole tree,
+and call path results borrowed strings that were freed later.
+
+- explore: build the call graph per file in its own arena, skip files
+  with no function symbol, and copy only function bodies
+- explore: drop the call graph when a file is removed
+- explore: call path results own their strings
+- watcher: on a git HEAD change, reconcile only the changed files
+- watcher: drop files that turn binary or oversized, keep the trigram
+  cap, and prune ignored directories
+- mcp: fix a codedb_context deadlock on uncached top-site reads
+---
+ src/explore.zig      | 114 ++++++++++++++++++++++++++++++----------
+ src/mcp.zig          |   8 +--
+ src/test_explore.zig | 120 +++++++++++++++++++++++++++++++++++++------
+ src/watcher.zig      | 104 +++++++++++++++++++++----------------
+ 4 files changed, 255 insertions(+), 91 deletions(-)
+
+diff --git a/src/explore.zig b/src/explore.zig
+index 5dbd259..b711543 100644
+--- a/src/explore.zig
++++ b/src/explore.zig
+@@ -2159,15 +2159,7 @@ pub const Explorer = struct {
+         self.mu.lock();
+         defer self.mu.unlock();
+         self.bumpSearchGen();
+-        if (self.call_graph) |*cg| {
+-            cg.deinit(self.allocator);
+-            self.call_graph = null;
+-            self.call_graph_exact = false;
+-        }
+-        if (self.call_centrality) |*cc| {
+-            cc.deinit();
+-            self.call_centrality = null;
+-        }
++        self.dropCallGraphLocked();
+ 
+         const outline_gop = try self.outlines.getOrPut(path);
+         const is_new = !outline_gop.found_existing;
+@@ -3108,10 +3100,25 @@ pub const Explorer = struct {
+         self.word_index_persisted_generation = self.word_index_generation;
+     }
+ 
++    /// Caller holds `mu` exclusively. Centrality keys borrow outline keys, so
++    /// every outline change or removal must drop the graph first.
++    fn dropCallGraphLocked(self: *Explorer) void {
++        if (self.call_graph) |*cg| {
++            cg.deinit(self.allocator);
++            self.call_graph = null;
++            self.call_graph_exact = false;
++        }
++        if (self.call_centrality) |*cc| {
++            cc.deinit();
++            self.call_centrality = null;
++        }
++    }
++
+     pub fn removeFile(self: *Explorer, path: []const u8) void {
+         self.mu.lock();
+         defer self.mu.unlock();
+         self.bumpSearchGen();
++        self.dropCallGraphLocked();
+         if (!self.word_index_complete) {
+             self.word_index_can_load_from_disk = false;
+         } else {
+@@ -3136,6 +3143,26 @@ pub const Explorer = struct {
+         }
+     }
+ 
++    /// removeFile for a path that may never have been indexed; skips the search
++    /// cache invalidation when there is nothing to drop.
++    pub fn removeFileIfIndexed(self: *Explorer, path: []const u8) void {
++        {
++            self.mu.lockShared();
++            defer self.mu.unlockShared();
++            if (!self.outlines.contains(path)) return;
++        }
++        self.removeFile(path);
++    }
++
++    /// Live updates keep a file's trigram admission and admit new files only
++    /// below `cap`, so edits and checkouts honor the scan-time cap.
++    pub fn trigramAdmits(self: *Explorer, path: []const u8, cap: usize) bool {
++        self.mu.lockShared();
++        defer self.mu.unlockShared();
++        if (self.outlines.contains(path)) return !self.skip_trigram_files.contains(path);
++        return self.trigram_index.fileCount() < cap;
++    }
++
+     pub fn getOutline(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) !?FileOutline {
+         self.mu.lockShared();
+         defer self.mu.unlockShared();
+@@ -3319,6 +3346,12 @@ pub const Explorer = struct {
+     pub fn getContent(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) !?[]u8 {
+         self.mu.lockShared();
+         defer self.mu.unlockShared();
++        return self.getContentLocked(path, allocator);
++    }
++
++    /// getContent for a caller already holding `mu` shared. A nested lockShared
++    /// deadlocks once a writer queues between the two acquisitions.
++    pub fn getContentLocked(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) !?[]u8 {
+         const ref = self.readContentForSearch(path, allocator) orelse return null;
+         if (ref.owned) return @constCast(ref.data);
+         return try allocator.dupe(u8, ref.data);
+@@ -6049,6 +6082,10 @@ pub const Explorer = struct {
+         var arena_state = std.heap.ArenaAllocator.init(allocator);
+         defer arena_state.deinit();
+         const a = arena_state.allocator();
++        // Edits rebuild this graph, so keep only function bodies and each file's
++        // bytes only while it is parsed: the peak is the bodies, not the corpus.
++        var file_arena = std.heap.ArenaAllocator.init(self.allocator);
++        defer file_arena.deinit();
+ 
+         var node_path: std.ArrayList([]const u8) = .empty;
+         var node_name: std.ArrayList([]const u8) = .empty;
+@@ -6059,9 +6096,14 @@ pub const Explorer = struct {
+ 
+         var it = self.outlines.iterator();
+         while (it.next()) |entry| {
++            const has_functions = for (entry.value_ptr.symbols.items) |sym| {
++                if (sym.kind == .function or sym.kind == .method) break true;
++            } else false;
++            if (!has_functions) continue;
++            _ = file_arena.reset(.retain_capacity);
++            const fa = file_arena.allocator();
+             const path = entry.key_ptr.*;
+-            const ref = self.readContentForSearch(path, a) orelse continue;
+-            defer ref.deinit();
++            const ref = self.readContentForSearch(path, fa) orelse continue;
+             const content = ref.data;
+             const direct_import_bindings = if (exact)
+                 self.callGraphZigImportBindings(entry.value_ptr, content, a) catch &.{}
+@@ -6071,9 +6113,9 @@ pub const Explorer = struct {
+             import_bindings.appendSlice(a, direct_import_bindings) catch return;
+             const file_func_start = funcs.items.len;
+             var offs: std.ArrayList(usize) = .empty;
+-            offs.append(a, 0) catch continue;
++            offs.append(fa, 0) catch continue;
+             for (content, 0..) |ch, i| {
+-                if (ch == '\n') offs.append(a, i + 1) catch break;
++                if (ch == '\n') offs.append(fa, i + 1) catch break;
+             }
+             const nlines = offs.items.len;
+             for (entry.value_ptr.symbols.items) |sym| {
+@@ -6083,7 +6125,7 @@ pub const Explorer = struct {
+                 const end_line = @min(sym.line_end, nlines);
+                 const end = if (end_line < nlines) offs.items[end_line] else content.len;
+                 if (end <= start) continue;
+-                const body = content[start..end];
++                const body = a.dupe(u8, content[start..end]) catch return;
+                 const is_zig = exact and entry.value_ptr.language == .zig;
+                 const has_thread_spawn = is_zig and std.mem.indexOf(u8, body, "std.Thread.spawn") != null;
+                 const id: codegraph.NodeId = @intCast(node_path.items.len);
+@@ -6328,17 +6370,17 @@ pub const Explorer = struct {
+         const cg = self.call_graph orelse return try allocator.alloc(CallPathStep, 0);
+ 
+         var candidates: std.ArrayList(CallPathStep) = .empty;
+-        errdefer candidates.deinit(allocator);
++        errdefer {
++            freeCallPathStepStrings(allocator, candidates.items);
++            candidates.deinit(allocator);
++        }
+         for (cg.node_name, 0..) |node_name, id| {
+             if (!std.mem.eql(u8, node_name, name)) continue;
+             if (path) |selected_path| {
+                 if (!std.mem.eql(u8, cg.node_path[id], selected_path)) continue;
+             }
+-            try candidates.append(allocator, .{
+-                .path = cg.node_path[id],
+-                .name = node_name,
+-                .line = cg.node_line[id],
+-            });
++            try candidates.ensureUnusedCapacity(allocator, 1);
++            candidates.appendAssumeCapacity(try ownedCallPathStep(allocator, cg, id));
+         }
+         return try candidates.toOwnedSlice(allocator);
+     }
+@@ -6391,17 +6433,35 @@ pub const Explorer = struct {
+         defer allocator.free(path);
+ 
+         var steps: std.ArrayList(CallPathStep) = .empty;
+-        errdefer steps.deinit(allocator);
+-        for (path) |nid| {
+-            try steps.append(allocator, .{
+-                .path = cg.node_path[nid],
+-                .name = cg.node_name[nid],
+-                .line = cg.node_line[nid],
+-            });
++        errdefer {
++            freeCallPathStepStrings(allocator, steps.items);
++            steps.deinit(allocator);
+         }
++        try steps.ensureTotalCapacity(allocator, path.len);
++        for (path) |nid| steps.appendAssumeCapacity(try ownedCallPathStep(allocator, cg, nid));
+         return try steps.toOwnedSlice(allocator);
+     }
+ 
++    /// Frees a result of findCallPath, findCallPathScoped or findCallPathCandidates.
++    pub fn freeCallPathSteps(allocator: std.mem.Allocator, steps: []CallPathStep) void {
++        freeCallPathStepStrings(allocator, steps);
++        allocator.free(steps);
++    }
++
++    fn freeCallPathStepStrings(allocator: std.mem.Allocator, steps: []const CallPathStep) void {
++        for (steps) |step| {
++            allocator.free(step.path);
++            allocator.free(step.name);
++        }
++    }
++
++    /// Results outlive `mu`, and any edit or delete frees the graph's strings.
++    fn ownedCallPathStep(allocator: std.mem.Allocator, cg: CallGraph, id: usize) !CallPathStep {
++        const path = try allocator.dupe(u8, cg.node_path[id]);
++        errdefer allocator.free(path);
++        return .{ .path = path, .name = try allocator.dupe(u8, cg.node_name[id]), .line = cg.node_line[id] };
++    }
++
+     pub fn searchContentRanked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+         // Result-cache front door — same discipline as searchContent's
+         // wrapper (gen read BEFORE the search; see that comment), but a
+diff --git a/src/mcp.zig b/src/mcp.zig
+index 49111bb..27dcdfb 100644
+--- a/src/mcp.zig
++++ b/src/mcp.zig
+@@ -2776,12 +2776,12 @@ fn handleCallpath(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
+         out.appendSlice(alloc, "error: callpath search failed") catch {};
+         return;
+     };
+-    defer alloc.free(from_candidates);
++    defer Explorer.freeCallPathSteps(alloc, from_candidates);
+     const to_candidates = explorer.findCallPathCandidates(to_name, to_path, alloc) catch {
+         out.appendSlice(alloc, "error: callpath search failed") catch {};
+         return;
+     };
+-    defer alloc.free(to_candidates);
++    defer Explorer.freeCallPathSteps(alloc, to_candidates);
+ 
+     const w = cio.listWriter(out, alloc);
+     if (from_candidates.len == 0) {
+@@ -2814,7 +2814,7 @@ fn handleCallpath(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
+         w.print("no call path from '{s}' to '{s}' within {d} hops\n", .{ from_name, to_name, max_hops }) catch {};
+         return;
+     };
+-    defer alloc.free(path);
++    defer Explorer.freeCallPathSteps(alloc, path);
+ 
+     w.print("call path ({d} hops): {s} → {s}\n", .{ path.len - 1, from_name, to_name }) catch {};
+     for (path, 0..) |step, i| {
+@@ -4949,7 +4949,7 @@ fn handleContext(
+             // each hit. Indexed cache hits common files in ~µs; arena owns the
+             // dupe so we don't leak.
+             const file_content: ?[]const u8 = blk: {
+-                const got = explorer.getContent(f.path, A) catch break :blk null;
++                const got = explorer.getContentLocked(f.path, A) catch break :blk null;
+                 break :blk got;
+             };
+             for (f.top) |h| {
+diff --git a/src/test_explore.zig b/src/test_explore.zig
+index dab663a..d5b6dc9 100644
+--- a/src/test_explore.zig
++++ b/src/test_explore.zig
+@@ -3295,10 +3295,98 @@ test "issue-656: call graph is stale and dangling after a file edit" {
+     );
+ 
+     const after = try explorer_inst.findCallPath("alpha", "beta", testing.allocator, 4);
+-    defer if (after) |steps| testing.allocator.free(steps);
++    defer if (after) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
+     try testing.expect(after != null);
+ }
+ 
++test "call paths resolve from disk after contents are released" {
++    var project = testing.tmpDir(.{});
++    defer project.cleanup();
++    // Every hop lives in its own file, so each body must outlive later reads.
++    const files = [_][2][]const u8{
++        .{ "chain_a.zig", "pub fn alpha() void {\n    beta();\n}\n" },
++        .{ "chain_b.zig", "pub fn beta() void {\n    // second hop\n    gamma();\n}\n" },
++        .{ "chain_c.zig", "pub fn gamma() void {\n    // third hop, longer comment\n    delta();\n}\n" },
++        .{ "chain_d.zig", "pub fn delta() void {\n    // last hop\n    epsilon();\n}\n" },
++        .{ "chain_e.zig", "pub fn epsilon() void {}\n" },
++        .{ "data.json", "{\"alpha\": 1}\n" },
++    };
++    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
++    for (files) |f| try project.dir.writeFile(io, .{ .sub_path = f[0], .data = f[1] });
++    const root = root_buf[0..try project.dir.realPathFile(io, ".", &root_buf)];
++
++    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
++    defer explorer_inst.deinit();
++    try explorer_inst.setRoot(io, root);
++    for (files) |f| try explorer_inst.indexFile(f[0], f[1]);
++    explorer_inst.releaseContents();
++
++    const path = (try explorer_inst.findCallPath("alpha", "epsilon", testing.allocator, 5)) orelse
++        return error.TestExpectedEqual;
++    defer Explorer.freeCallPathSteps(testing.allocator, path);
++    const expected = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon" };
++    try testing.expectEqual(expected.len, path.len);
++    for (expected, path) |name, step| try testing.expectEqualStrings(name, step.name);
++}
++
++test "removing a file drops the cached call graph" {
++    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
++    defer explorer_inst.deinit();
++    try explorer_inst.indexFile("caller.zig", "pub fn alpha() void {\n    beta();\n}\n");
++    try explorer_inst.indexFile("callee.zig", "pub fn beta() void {}\n");
++    const before = (try explorer_inst.findCallPath("alpha", "beta", testing.allocator, 5)) orelse
++        return error.TestExpectedEqual;
++    Explorer.freeCallPathSteps(testing.allocator, before);
++
++    explorer_inst.removeFile("callee.zig");
++    const after = try explorer_inst.findCallPath("alpha", "beta", testing.allocator, 5);
++    defer if (after) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
++    try testing.expect(after == null);
++}
++
++test "call path results stay valid after the graph is dropped" {
++    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
++    defer explorer_inst.deinit();
++    try explorer_inst.indexFile("caller.zig", "pub fn alpha() void {\n    beta();\n}\n");
++    try explorer_inst.indexFile("callee.zig", "pub fn beta() void {}\n");
++    try explorer_inst.indexFile("other.zig", "pub fn other() void {}\n");
++    const steps = (try explorer_inst.findCallPath("alpha", "beta", testing.allocator, 5)) orelse
++        return error.TestExpectedEqual;
++    defer Explorer.freeCallPathSteps(testing.allocator, steps);
++    const candidates = try explorer_inst.findCallPathCandidates("beta", null, testing.allocator);
++    defer Explorer.freeCallPathSteps(testing.allocator, candidates);
++
++    explorer_inst.removeFile("other.zig");
++    try testing.expectEqualStrings("caller.zig", steps[0].path);
++    try testing.expectEqualStrings("alpha", steps[0].name);
++    try testing.expectEqualStrings("callee.zig", steps[1].path);
++    try testing.expectEqualStrings("beta", steps[1].name);
++    try testing.expectEqualStrings("callee.zig", candidates[0].path);
++}
++
++test "trigramAdmits keeps admission for indexed files and caps new ones" {
++    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
++    defer explorer_inst.deinit();
++    try explorer_inst.indexFile("admitted.zig", "pub fn admitted() void {}\n");
++    try explorer_inst.indexFileSkipTrigram("skipped.zig", "pub fn skipped() void {}\n");
++
++    try testing.expect(explorer_inst.trigramAdmits("admitted.zig", 1));
++    try testing.expect(!explorer_inst.trigramAdmits("skipped.zig", 100));
++    try testing.expect(!explorer_inst.trigramAdmits("new.zig", 1));
++    try testing.expect(explorer_inst.trigramAdmits("new.zig", 2));
++}
++
++test "removeFileIfIndexed leaves search caches alone for unknown paths" {
++    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
++    defer explorer_inst.deinit();
++    try explorer_inst.indexFile("kept.zig", "pub fn kept() void {}\n");
++    const gen = explorer_inst.search_gen.load(.acquire);
++    explorer_inst.removeFileIfIndexed("never_indexed.zig");
++    try testing.expectEqual(gen, explorer_inst.search_gen.load(.acquire));
++    explorer_inst.removeFileIfIndexed("kept.zig");
++    try testing.expect(!explorer_inst.outlines.contains("kept.zig"));
++}
++
+ test "Swift multiline bodies and initializers participate in call paths" {
+     var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+     defer explorer_inst.deinit();
+@@ -3320,7 +3408,7 @@ test "Swift multiline bodies and initializers participate in call paths" {
+ 
+     const path = (try explorer_inst.findCallPath("init", "configure", testing.allocator, 2)) orelse
+         return error.TestExpectedEqual;
+-    defer testing.allocator.free(path);
++    defer Explorer.freeCallPathSteps(testing.allocator, path);
+     try testing.expectEqual(@as(usize, 2), path.len);
+     try testing.expectEqualStrings("init", path[0].name);
+     try testing.expectEqualStrings("configure", path[1].name);
+@@ -3345,7 +3433,7 @@ test "issue-718: call paths do not cross languages through name collisions" {
+     //   Zig handle -> Python route -> Zig parseRequest.
+     // There is no same-language `route`, so the honest answer is no path.
+     const path = try explorer_inst.findCallPath("handle", "parseRequest", testing.allocator, 4);
+-    defer if (path) |steps| testing.allocator.free(steps);
++    defer if (path) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
+     try testing.expect(path == null);
+ }
+ 
+@@ -3374,15 +3462,15 @@ test "issue-725: call graph resolves imported receiver and same-file helper" {
+ 
+     const imported = (try explorer_inst.findCallPath("cmdServe", "run", testing.allocator, 4)) orelse
+         return error.TestExpectedEqual;
+-    defer testing.allocator.free(imported);
++    defer Explorer.freeCallPathSteps(testing.allocator, imported);
+     try testing.expectEqual(@as(usize, 2), imported.len);
+     try testing.expectEqualStrings("src/server.zig", imported[1].path);
+ 
+     const real_chain = try explorer_inst.findCallPath("cmdServe", "serverOnly", testing.allocator, 4);
+-    defer if (real_chain) |steps| testing.allocator.free(steps);
++    defer if (real_chain) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
+     try testing.expect(real_chain != null);
+     const fabricated_chain = try explorer_inst.findCallPath("cmdServe", "workspaceOnly", testing.allocator, 4);
+-    defer if (fabricated_chain) |steps| testing.allocator.free(steps);
++    defer if (fabricated_chain) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
+     try testing.expect(fabricated_chain == null);
+ 
+     try explorer_inst.indexFile("src/mergequeue.zig",
+@@ -3403,13 +3491,13 @@ test "issue-725: call graph resolves imported receiver and same-file helper" {
+ 
+     const local = (try explorer_inst.findCallPath("enqueue", "persistLocked", testing.allocator, 4)) orelse
+         return error.TestExpectedEqual;
+-    defer testing.allocator.free(local);
++    defer Explorer.freeCallPathSteps(testing.allocator, local);
+     try testing.expectEqualStrings("src/mergequeue.zig", local[1].path);
+     const correct = try explorer_inst.findCallPath("enqueue", "correctOnly", testing.allocator, 4);
+-    defer if (correct) |steps| testing.allocator.free(steps);
++    defer if (correct) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
+     try testing.expect(correct != null);
+     const wrong = try explorer_inst.findCallPath("enqueue", "wrongOnly", testing.allocator, 4);
+-    defer if (wrong) |steps| testing.allocator.free(steps);
++    defer if (wrong) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
+     try testing.expect(wrong == null);
+ }
+ 
+@@ -3440,12 +3528,12 @@ test "issue-725: call graph follows an exact Zig re-export chain" {
+ 
+     const imported = (try explorer_inst.findCallPath("main", "run", testing.allocator, 4)) orelse
+         return error.TestExpectedEqual;
+-    defer testing.allocator.free(imported);
++    defer Explorer.freeCallPathSteps(testing.allocator, imported);
+     try testing.expectEqual(@as(usize, 2), imported.len);
+     try testing.expectEqualStrings("zigrep/src/exec/search_engine.zig", imported[1].path);
+ 
+     const real_chain = try explorer_inst.findCallPath("main", "engineOnly", testing.allocator, 4);
+-    defer if (real_chain) |steps| testing.allocator.free(steps);
++    defer if (real_chain) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
+     try testing.expect(real_chain != null);
+ }
+ 
+@@ -3478,10 +3566,10 @@ test "issue-725: nested Zig imports are not module re-exports" {
+ 
+     const real = (try explorer_inst.findCallPath("main", "run", testing.allocator, 4)) orelse
+         return error.TestExpectedEqual;
+-    defer testing.allocator.free(real);
++    defer Explorer.freeCallPathSteps(testing.allocator, real);
+     try testing.expectEqualStrings("src/root.zig", real[1].path);
+     const fabricated = try explorer_inst.findCallPath("main", "decoyOnly", testing.allocator, 4);
+-    defer if (fabricated) |steps| testing.allocator.free(steps);
++    defer if (fabricated) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
+     try testing.expect(fabricated == null);
+ }
+ 
+@@ -3508,14 +3596,14 @@ test "issue-725: Zig Thread.spawn callback adds a unique same-file edge" {
+ 
+     const callback = (try explorer_inst.findCallPath("run", "connection", testing.allocator, 4)) orelse
+         return error.TestExpectedEqual;
+-    defer testing.allocator.free(callback);
++    defer Explorer.freeCallPathSteps(testing.allocator, callback);
+     try testing.expectEqual(@as(usize, 2), callback.len);
+     try testing.expectEqualStrings("src/server.zig", callback[1].path);
+     const real_chain = try explorer_inst.findCallPath("run", "handle", testing.allocator, 4);
+-    defer if (real_chain) |steps| testing.allocator.free(steps);
++    defer if (real_chain) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
+     try testing.expect(real_chain != null);
+     const decoy_chain = try explorer_inst.findCallPath("run", "decoyOnly", testing.allocator, 4);
+-    defer if (decoy_chain) |steps| testing.allocator.free(steps);
++    defer if (decoy_chain) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
+     try testing.expect(decoy_chain == null);
+ }
+ 
+diff --git a/src/watcher.zig b/src/watcher.zig
+index 8d7279a..3113a85 100644
+--- a/src/watcher.zig
++++ b/src/watcher.zig
+@@ -132,6 +132,25 @@ fn rememberDirState(dirs: *DirMap, persistent: std.mem.Allocator, rel: []const u
+     dirs.put(key, state) catch persistent.free(key);
+ }
+ 
++/// The reconcile only adds directories, so a checkout that drops a tree must
++/// prune it here or every historical directory stays armed and re-listed.
++fn pruneVanishedDirs(io: std.Io, root_dir: std.Io.Dir, dirs: *DirMap, persistent: std.mem.Allocator) void {
++    var vanished: std.ArrayList([]const u8) = .empty;
++    defer vanished.deinit(persistent);
++    var it = dirs.keyIterator();
++    while (it.next()) |path| {
++        if (path.len == 0) continue;
++        const st = root_dir.statFile(io, path.*, .{}) catch {
++            vanished.append(persistent, path.*) catch return;
++            continue;
++        };
++        if (st.kind != .directory) vanished.append(persistent, path.*) catch return;
++    }
++    for (vanished.items) |path| {
++        if (dirs.fetchRemove(path)) |kv| persistent.free(kv.key);
++    }
++}
++
+ const InitialScanEntry = struct {
+     path: []u8,
+     size: u64,
+@@ -2198,6 +2217,27 @@ fn armAndCloseGap(
+     watch.arm(io, root_dir, known, dirs);
+ }
+ 
++test "pruneVanishedDirs drops removed and retyped directories only" {
++    const testing = std.testing;
++    const io = testing.io;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.createDirPath(io, "kept/nested");
++    try tmp.dir.writeFile(io, .{ .sub_path = "was_dir", .data = "now a file\n" });
++    var dirs = DirMap.init(testing.allocator);
++    defer {
++        var it = dirs.keyIterator();
++        while (it.next()) |key| testing.allocator.free(key.*);
++        dirs.deinit();
++    }
++    for ([_][]const u8{ "", "kept", "kept/nested", "gone", "gone/child", "was_dir" }) |path| {
++        try dirs.put(try testing.allocator.dupe(u8, path), .{ .mtime_ns = 0, .ctime_ns = 0, .inode = 0 });
++    }
++    pruneVanishedDirs(io, tmp.dir, &dirs, testing.allocator);
++    try testing.expectEqual(@as(u32, 3), dirs.count());
++    for ([_][]const u8{ "", "kept", "kept/nested" }) |path| try testing.expect(dirs.contains(path));
++}
++
+ test "rearm directory matching excludes fallback files and unrelated prefixes" {
+     if (!(comptime watch_kqueue or watch_inotify)) return error.SkipZigTest;
+     const testing = std.testing;
+@@ -2728,47 +2768,11 @@ pub fn incrementalLoop(io: std.Io, store: *Store, explorer: *Explorer, queue: *E
+         };
+ 
+         if (head_changed) {
+-            std.log.info("git HEAD changed — re-scanning", .{});
++            std.log.info("git HEAD changed — reconciling", .{});
+             last_git_head = current_head;
+-
+-            // Remove stale files from Explorer that may not exist on the new branch
+-            var remove_list: std.ArrayList([]const u8) = .empty;
+-            defer remove_list.deinit(backing);
+-            var kiter = known.iterator();
+-            while (kiter.next()) |kv| {
+-                remove_list.append(backing, kv.key_ptr.*) catch {};
+-            }
+-            for (remove_list.items) |path| {
+-                explorer.removeFile(path);
+-            }
+-
+-            // Clear known map
+-            var kiter2 = known.iterator();
+-            while (kiter2.next()) |kv| backing.free(kv.key_ptr.*);
+-            known.clearRetainingCapacity();
+-            var diter = dirs.iterator();
+-            while (diter.next()) |kv| backing.free(kv.key_ptr.*);
+-            dirs.clearRetainingCapacity();
+-
+-            // Re-scan with trigram cap
+-            var rescan_arena = std.heap.ArenaAllocator.init(backing);
+-            defer rescan_arena.deinit();
+-            const tmp = rescan_arena.allocator();
+-            const dir = stable_root;
+-            var walker = FilteredWalker.init(io, dir, tmp) catch continue;
+-            defer walker.deinit();
+-            const max_trigram_files = trigramFileCap();
+-            var file_count: usize = 0;
+-            while (walker.next() catch null) |entry| {
+-                _ = store.recordSnapshot(entry.path, entry.size, 0) catch {};
+-                file_count += 1;
+-                const effective_skip = file_count > max_trigram_files;
+-                indexFileContent(io, explorer, dir, entry.path, backing, effective_skip) catch {};
+-                const stat = project_file.statNoFollow(io, dir, entry.path) catch continue;
+-                const mtime: i64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_ms));
+-                const duped = backing.dupe(u8, entry.path) catch continue;
+-                known.put(duped, .{ .mtime = mtime, .size = entry.size, .hash = 0, .seen = false }) catch backing.free(duped);
+-            }
++            // A checkout rewrites only differing files, which the full metadata diff
++            // finds; re-reading every file emptied the index and moved it all to heap.
++            pruneVanishedDirs(io, stable_root, &dirs, backing);
+             armAndCloseGap(io, &watch, stable_root, store, explorer, queue, &known, &dirs, root, backing);
+             if (recursive != null) watch.reset(io);
+             continue;
+@@ -2833,8 +2837,13 @@ pub fn incrementalLoop(io: std.Io, store: *Store, explorer: *Explorer, queue: *E
+ /// hashAndIndexFile so the binary + trigram rules live in one spot.
+ fn indexContentBuffer(explorer: *Explorer, path: []const u8, content: []const u8, skip_trigram: bool) !void {
+     const check_len = @min(content.len, 512);
+-    if (std.mem.indexOfScalar(u8, content[0..check_len], 0) != null) return; // binary
+-    const effective_skip_trigram = skip_trigram or (content.len > max_trigram_file_bytes);
++    if (std.mem.indexOfScalar(u8, content[0..check_len], 0) != null) {
++        // A file that turned binary must not keep serving its old text.
++        explorer.removeFileIfIndexed(path);
++        return;
++    }
++    const effective_skip_trigram = skip_trigram or (content.len > max_trigram_file_bytes) or
++        !explorer.trigramAdmits(path, trigramFileCap());
+     if (effective_skip_trigram) {
+         try explorer.indexFileSkipTrigram(path, content);
+     } else {
+@@ -2853,7 +2862,10 @@ fn indexContentBuffer(explorer: *Explorer, path: []const u8, content: []const u8
+ /// `size` is the caller's already-stat'd size, so there is no extra stat here.
+ fn hashAndIndexFile(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: []const u8, size: u64) u64 {
+     if (shouldSkipFile(path)) return 0;
+-    if (size > max_indexed_file_bytes) return 0;
++    if (size > max_indexed_file_bytes) {
++        explorer.removeFileIfIndexed(path);
++        return 0;
++    }
+     var content_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+     defer content_arena.deinit();
+     const content = project_file.readAllocNoFollow(io, dir, path, content_arena.allocator(), .limited(max_indexed_file_bytes)) catch return std.math.maxInt(u64);
+@@ -3053,7 +3065,11 @@ fn applyKnownFile(
+     old.hash = hash;
+     store.noteMtime(logical_path, mtime);
+     if (FsEvent.init(stable_path, .modified, seq)) |ev| pushEventOrWait(queue, ev);
+-    if (content) |buf| indexContentBuffer(explorer, stable_path, buf, false) catch {};
++    if (content) |buf| {
++        indexContentBuffer(explorer, stable_path, buf, false) catch {};
++    } else if (stat.size > max_indexed_file_bytes) {
++        explorer.removeFileIfIndexed(stable_path);
++    }
+ }
+ 
+ const ParentIndex = struct {

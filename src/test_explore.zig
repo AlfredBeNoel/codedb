@@ -3364,6 +3364,30 @@ test "call path results stay valid after the graph is dropped" {
     try testing.expectEqualStrings("callee.zig", candidates[0].path);
 }
 
+test "an exact call graph upgrade keeps the approximate graph alive for readers" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("caller.zig", "pub fn alpha() void {\n    beta();\n}\n");
+    try explorer_inst.indexFile("callee.zig", "pub fn beta() void {}\n");
+    try explorer_inst.indexFile("other.zig", "pub fn other() void {}\n");
+    explorer_inst.buildCallCentrality();
+    try testing.expect(!explorer_inst.call_graph_exact);
+    // A ranked search in another session copies the graph under a shared lock.
+    const held = explorer_inst.call_graph orelse return error.TestExpectedEqual;
+
+    const candidates = try explorer_inst.findCallPathCandidates("beta", null, testing.allocator);
+    defer Explorer.freeCallPathSteps(testing.allocator, candidates);
+    try testing.expect(explorer_inst.call_graph_exact);
+    var names: usize = 0;
+    for (held.node_name) |name| {
+        if (std.mem.eql(u8, name, "alpha") or std.mem.eql(u8, name, "beta") or std.mem.eql(u8, name, "other")) names += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), names);
+
+    explorer_inst.removeFile("other.zig");
+    try testing.expectEqual(@as(usize, 0), explorer_inst.retired_call_graphs.items.len);
+}
+
 test "trigramAdmits keeps admission for indexed files and caps new ones" {
     var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer_inst.deinit();

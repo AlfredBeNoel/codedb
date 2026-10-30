@@ -1851,6 +1851,11 @@ pub const Explorer = struct {
     /// Ranking uses the historical fast approximate graph. User-visible
     /// callpaths upgrade it in place to strict scoped/import-aware resolution.
     call_graph_exact: bool = false,
+    /// Graphs an exact upgrade replaced under a shared `mu`; readers may still
+    /// hold them, so only an exclusive `mu` frees them.
+    retired_call_graphs: std.ArrayList(CallGraph) = .empty,
+    /// Builds publish `call_graph` under a shared `mu`; readers copy it under this lock.
+    call_graph_publish_mu: cio.Mutex = .{},
     centrality_build_mu: cio.Mutex = .{},
     root_dir: ?std.Io.Dir = null,
     /// Absolute project root path (duped in setRoot) — needed to shell out to
@@ -2068,8 +2073,8 @@ pub const Explorer = struct {
         self.outline_render_cache.deinit();
         self.fuzzy_file_cache.deinit();
         self.word_render_cache.deinit();
-        if (self.call_centrality) |*c| c.deinit();
-        if (self.call_graph) |*cg| cg.deinit(self.allocator);
+        self.dropCallGraphLocked();
+        self.retired_call_graphs.deinit(self.allocator);
         if (self.co_change) |*cc| git.freeCoChange(cc, self.allocator);
         if (self.root_path) |p| self.allocator.free(p);
 
@@ -3118,6 +3123,8 @@ pub const Explorer = struct {
             self.call_graph = null;
             self.call_graph_exact = false;
         }
+        for (self.retired_call_graphs.items) |*cg| cg.deinit(self.allocator);
+        self.retired_call_graphs.clearRetainingCapacity();
         if (self.call_centrality) |*cc| {
             cc.deinit();
             self.call_centrality = null;
@@ -5739,7 +5746,7 @@ pub const Explorer = struct {
     /// each reached file's minimum hop distance. Arena-allocated; null when no
     /// graph is built or no term names a symbol, so ranking is unchanged.
     fn queryGraphDistances(self: *Explorer, terms: *const std.StringHashMap(void), ta: std.mem.Allocator) ?std.StringHashMap(u8) {
-        const cg = self.call_graph orelse return null;
+        const cg = self.publishedCallGraph() orelse return null;
         const n = cg.node_name.len;
         if (n == 0) return null;
         const max_hops: u8 = 3;
@@ -6113,11 +6120,7 @@ pub const Explorer = struct {
         self.centrality_build_mu.lock();
         defer self.centrality_build_mu.unlock();
         if (self.call_graph != null and (!exact or self.call_graph_exact)) return;
-        if (exact) {
-            if (self.call_graph) |*cg| cg.deinit(self.allocator);
-            self.call_graph = null;
-            self.call_graph_exact = false;
-        }
+        if (self.call_graph != null) self.retired_call_graphs.ensureUnusedCapacity(self.allocator, 1) catch return;
 
         // Edits rebuild this graph, so keep only function bodies and each file's
         // bytes only while it is parsed. Page-backed: malloc keeps large freed blocks dirty.
@@ -6351,18 +6354,30 @@ pub const Explorer = struct {
             self.call_centrality = cmap;
         }
 
-        self.call_graph = .{
-            .edges = edges_owned,
-            .adj = adj,
-            .radj = radj,
-            .node_path = np,
-            .node_name = nn,
-            .node_line = nl,
-        };
-        self.call_graph_exact = exact;
+        {
+            self.call_graph_publish_mu.lock();
+            defer self.call_graph_publish_mu.unlock();
+            if (self.call_graph) |old| self.retired_call_graphs.appendAssumeCapacity(old);
+            self.call_graph = .{
+                .edges = edges_owned,
+                .adj = adj,
+                .radj = radj,
+                .node_path = np,
+                .node_name = nn,
+                .node_line = nl,
+            };
+            self.call_graph_exact = exact;
+        }
         // The graph-distance boost gate (`call_graph != null`) just flipped:
         // results cached before the build could differ from a fresh search.
         self.bumpSearchGen();
+    }
+
+    /// Caller holds `mu` shared; the copy stays valid until an exclusive `mu`.
+    fn publishedCallGraph(self: *Explorer) ?CallGraph {
+        self.call_graph_publish_mu.lock();
+        defer self.call_graph_publish_mu.unlock();
+        return self.call_graph;
     }
 
     fn ensureCallGraph(self: *Explorer) void {
@@ -6407,7 +6422,7 @@ pub const Explorer = struct {
         defer self.mu.unlockShared();
 
         self.ensureExactCallGraph();
-        const cg = self.call_graph orelse return try allocator.alloc(CallPathStep, 0);
+        const cg = self.publishedCallGraph() orelse return try allocator.alloc(CallPathStep, 0);
 
         var candidates: std.ArrayList(CallPathStep) = .empty;
         errdefer {
@@ -6443,7 +6458,7 @@ pub const Explorer = struct {
         defer self.mu.unlockShared();
 
         self.ensureExactCallGraph();
-        const cg = self.call_graph orelse return null;
+        const cg = self.publishedCallGraph() orelse return null;
 
         var from_ids: std.ArrayList(codegraph.NodeId) = .empty;
         defer from_ids.deinit(allocator);

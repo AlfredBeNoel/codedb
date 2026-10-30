@@ -336,6 +336,9 @@ const ProjectCache = struct {
     default_deps_cache: DepsCache,
     default_semantic_cache: semantic_index_mod.SearchCache,
     content_cache_capacity: u32,
+    /// The default explorer stays rooted at `default_path` for the session,
+    /// so a `project` naming that root can use it instead of a snapshot copy.
+    default_root_fixed: bool = false,
 
     fn init(alloc_: std.mem.Allocator, default_path_: []const u8, content_cache_capacity_: u32) ProjectCache {
         return .{
@@ -410,7 +413,8 @@ const ProjectCache = struct {
         default_exp: *Explorer,
         default_store: *Store,
     ) !ProjectCtx {
-        const raw_path = path orelse return ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache, .deps_cache = &self.default_deps_cache, .semantic_cache = &self.default_semantic_cache };
+        const default_ctx = ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache, .deps_cache = &self.default_deps_cache, .semantic_cache = &self.default_semantic_cache };
+        const raw_path = path orelse return default_ctx;
         const parsed_path = local_uri.parseRootReference(self.alloc, raw_path) catch return error.PathNotAllowed;
         defer self.alloc.free(parsed_path);
 
@@ -419,6 +423,8 @@ const ProjectCache = struct {
         defer if (candidate_live) candidate.deinit();
         try candidate.setRoot(io, parsed_path);
         const canonical_root = candidate.root_path orelse return error.PathNotAllowed;
+        // Each shared-server session would otherwise load its own copy of the root.
+        if (self.default_root_fixed and std.mem.eql(u8, canonical_root, self.default_path)) return default_ctx;
 
         self.mu.lock();
         defer self.mu.unlock();
@@ -1304,6 +1310,7 @@ pub fn runPeer(
     last_activity.store(cio.milliTimestamp(), .release);
 
     var cache = ProjectCache.init(alloc, default_path, content_cache_capacity);
+    cache.default_root_fixed = deferred_scan == null;
     defer cache.deinit();
 
     // Build the `tools/list` payload. The discriminated `oneOf` on the
@@ -8017,6 +8024,27 @@ test "issue-353: project cache invalidation reloads newly written snapshots" {
     const new_ctx = try cache.get(io, project_path, &default_explorer, &default_store);
     try testing.expect(!new_ctx.explorer.outlines.contains("src/old.zig"));
     try testing.expect(new_ctx.explorer.outlines.contains("src/new.zig"));
+}
+
+test "project cache: a project naming the fixed default root uses the default index" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPathFile(io, ".", &root_buf)];
+
+    var default_explorer = Explorer.init(testing.allocator, explore_mod.Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer default_explorer.deinit();
+    try default_explorer.setRoot(io, root);
+    var default_store = Store.init(testing.allocator);
+    defer default_store.deinit();
+
+    var cache = ProjectCache.init(testing.allocator, root, explore_mod.Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer cache.deinit();
+    cache.default_root_fixed = true;
+    const ctx = try cache.get(io, root, &default_explorer, &default_store);
+    try testing.expect(ctx.explorer == &default_explorer);
+    try testing.expect(ctx.store == &default_store);
 }
 
 test "codedb_snapshot cache reuses output until store seq changes" {

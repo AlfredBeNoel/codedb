@@ -91,14 +91,17 @@ pub const Endpoint = struct {
         var ep = Endpoint{ .key = key };
         const dir = socketDir(&ep.dir_buf) orelse return error.NoSocketDir;
         ep.dir_len = dir.len;
-        if (std.fs.path.dirname(dir)) |parent| std.Io.Dir.cwd().createDirPath(io, parent) catch {};
-        var dir_z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        const dir_z = cio.bufPrintZ(&dir_z_buf, "{s}", .{dir}) catch return error.NoSocketDir;
-        _ = std.c.mkdir(dir_z.ptr, 0o700);
         var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
         const sock = ep.path(&sock_buf, "sock") orelse return error.SocketPathTooLong;
         // sockaddr_un holds 104 bytes on macOS, 108 on Linux.
         _ = cli_proxy.cliFillSockaddr(sock) orelse return error.SocketPathTooLong;
+        if (std.fs.path.dirname(dir)) |parent| std.Io.Dir.cwd().createDirPath(io, parent) catch {};
+        var dir_z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const dir_z = cio.bufPrintZ(&dir_z_buf, "{s}", .{dir}) catch return error.NoSocketDir;
+        _ = std.c.mkdir(dir_z.ptr, 0o700);
+        // Anyone else who can write here could plant <key>.log as a symlink
+        // and have the spawn truncate its target.
+        try checkDirPrivate(dir_z);
         return ep;
     }
 
@@ -110,6 +113,7 @@ pub const Endpoint = struct {
 /// Why a client serves in-process; logged so a fallback is never silent.
 const Unavailable = error{
     NoSocketDir,
+    SocketDirUnsafe,
     SocketPathTooLong,
     SocketDirNotWritable,
     ServerRefused,
@@ -117,6 +121,30 @@ const Unavailable = error{
     ServerExitedBeforeListening,
     ConnectTimeout,
 };
+
+/// A real directory (not a symlink) that we own and no one else can write.
+fn checkDirPrivate(dir_z: [:0]const u8) Unavailable!void {
+    const fd = std.c.open(dir_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, @as(c_uint, 0));
+    if (fd < 0) return switch (std.c.errno(fd)) {
+        .LOOP, .NOTDIR => error.SocketDirUnsafe,
+        else => error.NoSocketDir,
+    };
+    defer _ = std.c.close(fd);
+    const owner = fdOwnerMode(fd) orelse return error.NoSocketDir;
+    if (owner.uid != std.c.getuid() or (owner.mode & 0o022) != 0) return error.SocketDirUnsafe;
+}
+
+fn fdOwnerMode(fd: c_int) ?struct { uid: std.c.uid_t, mode: u32 } {
+    if (comptime builtin.os.tag == .linux) {
+        // Zig's libc bindings have no fstat on Linux; AT_EMPTY_PATH stats the fd itself.
+        var stx: std.os.linux.Statx = undefined;
+        if (std.c.statx(fd, "", 0x1000, .{ .MODE = true, .UID = true }, &stx) != 0) return null;
+        return .{ .uid = stx.uid, .mode = stx.mode };
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return null;
+    return .{ .uid = st.uid, .mode = st.mode };
+}
 
 fn socketDir(buf: []u8) ?[]const u8 {
     if (cio.posixGetenv("CODEDB_MCP_SOCKET_DIR")) |dir| {
@@ -133,7 +161,7 @@ const LockAttempt = union(enum) {
 };
 
 fn lockServer(lock_path: [:0]const u8) LockAttempt {
-    const fd = std.c.open(lock_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(c_uint, 0o600));
+    const fd = std.c.open(lock_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .CLOEXEC = true }, @as(c_uint, 0o600));
     if (fd < 0) return .unavailable;
     if (std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB) != 0) {
         _ = std.c.close(fd);
@@ -325,15 +353,17 @@ fn spawnServer(spawn: SpawnArgs, key: u64, lock_fd: c_int, log_path: [:0]const u
     const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, @as(c_uint, 0));
     if (devnull < 0) return false;
     defer _ = std.c.close(devnull);
-    const log_fd = std.c.open(log_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, @as(c_uint, 0o600));
+    const log_fd = std.c.open(log_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true, .CLOEXEC = true }, @as(c_uint, 0o600));
     defer if (log_fd >= 0) {
         _ = std.c.close(log_fd);
     };
     const envp = cio.environ();
+    // Any fd below the soft limit may be an agent's inheritable pipe.
+    const fd_bound: c_int = if (std.posix.getrlimit(.NOFILE)) |lim| @intCast(@min(lim.cur, 1 << 20)) else |_| 1 << 16;
 
     const pid = std.c.fork();
     if (pid < 0) return false;
-    if (pid == 0) daemonize(self_exe.ptr, &argv, envp, devnull, if (log_fd >= 0) log_fd else devnull, lock_fd);
+    if (pid == 0) daemonize(self_exe.ptr, &argv, envp, devnull, if (log_fd >= 0) log_fd else devnull, lock_fd, fd_bound);
     var status: c_int = 0;
     while (true) {
         const rc = std.c.waitpid(pid, &status, 0);
@@ -344,14 +374,14 @@ fn spawnServer(spawn: SpawnArgs, key: u64, lock_fd: c_int, log_path: [:0]const u
 }
 
 /// Runs in the forked child: only async-signal-safe calls until execve.
-fn daemonize(exe: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, devnull: c_int, log_fd: c_int, lock_fd: c_int) noreturn {
+fn daemonize(exe: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, devnull: c_int, log_fd: c_int, lock_fd: c_int, fd_bound: c_int) noreturn {
     _ = std.c.setsid();
     const pid = std.c.fork();
     if (pid != 0) std.c._exit(if (pid > 0) 0 else 1);
     // Lift every fd above the targets first so no dup2 clobbers a source.
-    const high_null = std.c.fcntl(devnull, std.c.F.DUPFD, @as(c_int, 10));
-    const high_log = std.c.fcntl(log_fd, std.c.F.DUPFD, @as(c_int, 10));
-    const high_lock = std.c.fcntl(lock_fd, std.c.F.DUPFD, @as(c_int, 10));
+    const high_null = std.c.fcntl(devnull, std.c.F.DUPFD_CLOEXEC, @as(c_int, 10));
+    const high_log = std.c.fcntl(log_fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 10));
+    const high_lock = std.c.fcntl(lock_fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 10));
     if (high_null < 0 or high_log < 0 or high_lock < 0) std.c._exit(1);
     _ = std.c.dup2(high_null, 0);
     _ = std.c.dup2(high_null, 1);
@@ -359,7 +389,7 @@ fn daemonize(exe: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:nu
     _ = std.c.dup2(high_lock, inherited_lock_fd);
     // The server must not keep an agent's pipes, or that agent never sees EOF.
     var fd: c_int = inherited_lock_fd + 1;
-    while (fd < 256) : (fd += 1) _ = std.c.close(fd);
+    while (fd < fd_bound) : (fd += 1) _ = std.c.close(fd);
     _ = std.c.execve(exe, argv, envp);
     std.c._exit(127);
 }
@@ -554,6 +584,26 @@ test "mcp shared: a socket path beyond sockaddr_un is refused, not truncated" {
     const long_dir = "/nonexistent-codedb-test/" ++ @as([96]u8, @splat('d'));
     cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", long_dir);
     try testing.expectError(error.SocketPathTooLong, Endpoint.init(threaded.io(), 1));
+}
+
+test "mcp shared: a socket dir others can write is refused" {
+    if (comptime !supported) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(threaded.io(), &dir_buf);
+    var run_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const run_dir = try cio.bufPrintZ(&run_buf, "{s}/run", .{dir_buf[0..dir_len]});
+    try testing.expectEqual(@as(c_int, 0), std.c.mkdir(run_dir.ptr, 0o700));
+    _ = std.c.chmod(run_dir.ptr, 0o777);
+    const prev_dir = cio.posixGetenv("CODEDB_MCP_SOCKET_DIR");
+    defer if (prev_dir) |d| cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", d) else cio.posixUnsetenv("CODEDB_MCP_SOCKET_DIR");
+    cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", run_dir);
+    try testing.expectError(error.SocketDirUnsafe, Endpoint.init(threaded.io(), 1));
+    _ = std.c.chmod(run_dir.ptr, 0o700);
+    _ = try Endpoint.init(threaded.io(), 1);
 }
 
 test "mcp shared: lock fd argument parsing" {

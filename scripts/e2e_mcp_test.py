@@ -36,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import http.client
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -1321,6 +1322,103 @@ def run_scenario_9_bootstrap_temp_read(binary: str) -> list[TestResult]:
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 
+def run_scenario_10_branch_switch_reconcile(binary: str, project: str) -> list[TestResult]:
+    """git checkout updates changed, added and deleted files and leaves the rest indexed."""
+    results: list[TestResult] = []
+
+    def t(name: str) -> TestResult:
+        r = TestResult(f"[S10] {name}")
+        results.append(r)
+        return r
+
+    def git(root: Path, *args: str) -> None:
+        subprocess.run(["git", "-c", "user.name=e2e", "-c", "user.email=e2e@example.invalid", *args],
+                       cwd=root, check=True, capture_output=True)
+
+    def status_seq(p: MCPProcess) -> int:
+        m = re.search(r"seq: (\d+)", tool_text(p.call_tool("codedb_status", {})))
+        return int(m.group(1)) if m else -1
+
+    unchanged = 80
+    with tempfile.TemporaryDirectory(prefix="codedb-branch-switch-", dir=Path(project).parent) as tmp:
+        root = Path(tmp)
+        git(root, "init", "-q", "-b", "base")
+        (root / "pyproject.toml").write_text("[project]\nname = 'branch-switch'\nversion = '0'\n")
+        for i in range(unchanged):
+            (root / f"stable_{i}.py").write_text(f"def stable_fn_{i}():\n    return {i}\n")
+        (root / "shared.py").write_text("def shared_base_marker():\n    return 'base'\n")
+        (root / "gone.py").write_text("def gone_only_on_base():\n    return 'gone'\n")
+        git(root, "add", "-A")
+        git(root, "commit", "-q", "-m", "base")
+        git(root, "checkout", "-q", "-b", "alt")
+        (root / "shared.py").write_text("def shared_alt_marker():\n    return 'alt'\n")
+        (root / "gone.py").unlink()
+        (root / "fresh.py").write_text("def fresh_only_on_alt():\n    return 'fresh'\n")
+        git(root, "add", "-A")
+        git(root, "commit", "-q", "-m", "alt")
+        git(root, "checkout", "-q", "base")
+        p = MCPProcess(binary, [], cwd="/", command=[binary, str(root), "mcp", "--no-telemetry"])
+
+        try:
+            r = t("initial scan completes")
+            if not do_initialize(p, with_roots=False) or not wait_for_scan(p):
+                r.fail("MCP server did not become ready")
+                return results
+            r.ok()
+
+            # The watcher records the baseline HEAD after it logs its mode.
+            watching = wait_until(lambda: any("watcher:" in l for l in p.stderr_lines()), timeout=15.0)
+            time.sleep(1.0)
+            seq_before = status_seq(p)
+            git(root, "checkout", "-q", "alt")
+            r = t("watcher sees the HEAD change")
+            if watching and wait_until(lambda: any("git HEAD changed" in l for l in p.stderr_lines()), timeout=15.0):
+                r.ok()
+            else:
+                r.fail("no 'git HEAD changed' line on stderr")
+                return results
+
+            def symbol_has(name: str, path: str) -> bool:
+                return path in tool_text(p.call_tool("codedb_symbol", {"name": name}))
+
+            seen, ms = wait_until_ms(lambda: symbol_has("fresh_only_on_alt", "fresh.py"), timeout=15.0)
+            r = t("added file visible after checkout")
+            if not seen:
+                r.fail(f"fresh.py not indexed after {ms:.0f}ms")
+                return results
+            r.ok(f"{ms:.0f}ms")
+
+            r = t("changed file reindexed after checkout")
+            if wait_until(lambda: symbol_has("shared_alt_marker", "shared.py")) and not symbol_has("shared_base_marker", "shared.py"):
+                r.ok()
+            else:
+                r.fail("shared.py still shows base content")
+
+            r = t("deleted file removed after checkout")
+            if wait_until(lambda: not symbol_has("gone_only_on_base", "gone.py")):
+                r.ok()
+            else:
+                r.fail("gone.py still indexed")
+
+            r = t("unchanged files stay indexed")
+            if symbol_has("stable_fn_7", "stable_7.py"):
+                r.ok()
+            else:
+                r.fail("stable_7.py lost from the index")
+
+            # A full re-read records one version per file; a reconcile records the 3 changes.
+            delta = status_seq(p) - seq_before
+            r = t("checkout does not re-index unchanged files")
+            if 0 <= delta < unchanged // 2:
+                r.ok(f"seq +{delta}")
+            else:
+                r.fail(f"seq +{delta} for 3 changed files")
+        finally:
+            p.close()
+
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="codedb MCP E2E test harness")
     parser.add_argument("--binary", default="zig-out/bin/codedb",
@@ -1372,6 +1470,9 @@ def main() -> int:
 
     print(f"\n{CYAN}── Scenario 9: bootstrapable temp-root read parity ──{RESET}")
     all_results += run_scenario_9_bootstrap_temp_read(binary)
+
+    print(f"\n{CYAN}── Scenario 10: git branch switch reconciles without a full re-index ──{RESET}")
+    all_results += run_scenario_10_branch_switch_reconcile(binary, project)
 
     print()
     passed = 0

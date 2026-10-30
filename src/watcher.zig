@@ -2728,47 +2728,10 @@ pub fn incrementalLoop(io: std.Io, store: *Store, explorer: *Explorer, queue: *E
         };
 
         if (head_changed) {
-            std.log.info("git HEAD changed — re-scanning", .{});
+            std.log.info("git HEAD changed — reconciling", .{});
             last_git_head = current_head;
-
-            // Remove stale files from Explorer that may not exist on the new branch
-            var remove_list: std.ArrayList([]const u8) = .empty;
-            defer remove_list.deinit(backing);
-            var kiter = known.iterator();
-            while (kiter.next()) |kv| {
-                remove_list.append(backing, kv.key_ptr.*) catch {};
-            }
-            for (remove_list.items) |path| {
-                explorer.removeFile(path);
-            }
-
-            // Clear known map
-            var kiter2 = known.iterator();
-            while (kiter2.next()) |kv| backing.free(kv.key_ptr.*);
-            known.clearRetainingCapacity();
-            var diter = dirs.iterator();
-            while (diter.next()) |kv| backing.free(kv.key_ptr.*);
-            dirs.clearRetainingCapacity();
-
-            // Re-scan with trigram cap
-            var rescan_arena = std.heap.ArenaAllocator.init(backing);
-            defer rescan_arena.deinit();
-            const tmp = rescan_arena.allocator();
-            const dir = stable_root;
-            var walker = FilteredWalker.init(io, dir, tmp) catch continue;
-            defer walker.deinit();
-            const max_trigram_files = trigramFileCap();
-            var file_count: usize = 0;
-            while (walker.next() catch null) |entry| {
-                _ = store.recordSnapshot(entry.path, entry.size, 0) catch {};
-                file_count += 1;
-                const effective_skip = file_count > max_trigram_files;
-                indexFileContent(io, explorer, dir, entry.path, backing, effective_skip) catch {};
-                const stat = project_file.statNoFollow(io, dir, entry.path) catch continue;
-                const mtime: i64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_ms));
-                const duped = backing.dupe(u8, entry.path) catch continue;
-                known.put(duped, .{ .mtime = mtime, .size = entry.size, .hash = 0, .seen = false }) catch backing.free(duped);
-            }
+            // A checkout rewrites only differing files, which the full metadata diff
+            // finds; re-reading every file emptied the index and moved it all to heap.
             armAndCloseGap(io, &watch, stable_root, store, explorer, queue, &known, &dirs, root, backing);
             if (recursive != null) watch.reset(io);
             continue;

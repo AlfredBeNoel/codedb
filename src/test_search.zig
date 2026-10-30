@@ -2052,7 +2052,7 @@ test "audit: searchContent loses a word-indexed file >512KB evicted from the con
     try explorer.indexFile("big.zig", big.items);
     try explorer.indexFile("filler.zig", "fn g() void {}\n");
 
-    try testing.expect(explorer.word_index.search("widgetzzz").len > 0);
+    try testing.expect((try explorer.word_index.search("widgetzzz", testing.allocator)).items.len > 0);
 
     const results = try explorer.searchContent("widgetzzz", testing.allocator, 10);
     defer {

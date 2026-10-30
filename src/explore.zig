@@ -1836,6 +1836,9 @@ pub const Explorer = struct {
     /// merge them after the commit loop (see watcher.initialScanWithWorkerCount).
     defer_word_index: bool = false,
     mu: cio.RwLock = .{},
+    /// One full word-index rebuild at a time: the warmup thread and the first
+    /// query would otherwise each build a complete index concurrently.
+    word_index_rebuild_mu: cio.Mutex = .{},
     /// Per-file call-graph centrality (PageRank by default, or in-degree when
     /// CODEDB_IN_DEGREE_CENTRALITY is set). Built lazily, used as an additive
     /// ranking boost in searchContentRanked. Null until built; guarded by
@@ -2026,7 +2029,7 @@ pub const Explorer = struct {
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
             .symbol_index_complete = true,
             .def_token_index = std.StringHashMap(std.ArrayList(u32)).init(allocator),
-            .word_index = WordIndex.init(allocator),
+            .word_index = WordIndex.initIsolated(allocator),
             .trigram_index = .{ .heap = TrigramIndex.init(allocator) },
             .skip_trigram_files = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
@@ -2855,10 +2858,14 @@ pub const Explorer = struct {
     /// by streaming source files from the project root when the content cache
     /// was capped during fast snapshot restore.
     pub fn rebuildWordIndex(self: *Explorer) !void {
+        self.word_index_rebuild_mu.lock();
+        defer self.word_index_rebuild_mu.unlock();
         const source_paths = blk: {
             self.mu.lockShared();
             defer self.mu.unlockShared();
 
+            // A rebuild that finished while this caller waited already did the work.
+            if (self.word_index_complete) return;
             if (self.contents.len() == self.outlines.count()) break :blk null;
             if (self.io == null or self.root_dir == null) return error.WordIndexIncomplete;
 
@@ -2879,18 +2886,21 @@ pub const Explorer = struct {
             self.allocator.free(paths);
         };
 
-        var rebuilt = WordIndex.init(self.allocator);
+        var rebuilt = WordIndex.initIsolated(self.allocator);
         errdefer rebuilt.deinit();
 
         if (source_paths) |paths| {
             const io = self.io orelse return error.WordIndexIncomplete;
             const dir = self.root_dir orelse return error.WordIndexIncomplete;
             const canonical_root = self.root_path orelse return error.WordIndexIncomplete;
+            // One reused page-backed buffer: freed malloc blocks for every file
+            // would stay dirty after the rebuild.
+            var read_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer read_arena.deinit();
             for (paths) |path| {
-                const content = try project_file.readAllocNoFollowAtRoot(io, dir, canonical_root, path, self.allocator, .limited(64 * 1024 * 1024));
-                errdefer self.allocator.free(content);
+                _ = read_arena.reset(.retain_capacity);
+                const content = try project_file.readAllocNoFollowAtRoot(io, dir, canonical_root, path, read_arena.allocator(), .limited(64 * 1024 * 1024));
                 try rebuilt.indexFile(path, content);
-                self.allocator.free(content);
             }
         } else {
             self.mu.lockShared();
@@ -3112,6 +3122,32 @@ pub const Explorer = struct {
             cc.deinit();
             self.call_centrality = null;
         }
+    }
+
+    /// Swap the in-memory word index for the mmap of the file just persisted
+    /// from it, so its postings leave the heap. Drops `mapped` if it is stale.
+    pub fn adoptPersistedWordIndex(self: *Explorer, generation: u64, mapped: WordIndex) void {
+        var index = mapped;
+        self.mu.lock();
+        defer self.mu.unlock();
+        // The disk compacts doc ids, so only a hole-free index keeps every id.
+        const same_doc_ids = index.id_to_path.items.len == self.word_index.id_to_path.items.len;
+        if (!self.word_index_complete or self.word_index_generation != generation or !same_doc_ids) {
+            index.deinit();
+            return;
+        }
+        // The disk keeps no zero-token docs, but BM25 counts them in N and avgdl.
+        var lengths = self.word_index.doc_lengths.iterator();
+        while (lengths.next()) |e| {
+            if (e.value_ptr.* == 0) index.doc_lengths.put(e.key_ptr.*, 0) catch {
+                index.deinit();
+                return;
+            };
+        }
+        index.skip_file_words = self.word_index.skip_file_words;
+        index.enabled = self.word_index.enabled;
+        self.word_index.deinit();
+        self.word_index = index;
     }
 
     pub fn removeFile(self: *Explorer, path: []const u8) void {
@@ -4554,7 +4590,9 @@ pub const Explorer = struct {
         // with more exact word hits so popular identifiers and skip-trigram
         // canonical files are not hidden behind low-signal posting entries.
         const t0_start = cio.nanoTimestamp();
-        const word_hits = self.word_index.search(query);
+        const word_lookup = try self.word_index.search(query, allocator);
+        defer word_lookup.deinit(allocator);
+        const word_hits = word_lookup.items;
         if (word_hits.len > 0) {
             const Tier0File = struct {
                 path: []const u8,
@@ -4986,7 +5024,9 @@ pub const Explorer = struct {
 
         var breakdown: SearchBreakdown = .{};
         const t0_start = cio.nanoTimestamp();
-        const word_hits = self.word_index.search(query);
+        const word_lookup = try self.word_index.search(query, allocator);
+        defer word_lookup.deinit(allocator);
+        const word_hits = word_lookup.items;
         if (word_hits.len == 0) return false;
 
         const Tier0File = struct {
@@ -6607,7 +6647,9 @@ pub const Explorer = struct {
         var term_iter = terms_set.keyIterator();
         while (term_iter.next()) |term_ptr| {
             const term = term_ptr.*;
-            const hits = self.word_index.search(term);
+            const term_lookup = try self.word_index.search(term, ta);
+            defer term_lookup.deinit(ta);
+            const hits = term_lookup.items;
             if (hits.len == 0) continue;
 
             // df: distinct doc_ids in this posting list. tf: count of (term,doc)
@@ -6961,7 +7003,8 @@ pub const Explorer = struct {
             const tok_gop = try seen_tokens.getOrPut(lower);
             if (tok_gop.found_existing) continue;
             token_serial += 1;
-            for (self.word_index.search(lower)) |h| {
+            const token_lookup = try self.word_index.search(lower, sa);
+            for (token_lookup.items) |h| {
                 const gop = try per_doc.getOrPut(h.doc_id);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = .{ .distinct = 1, .total = 1, .line = h.line_num, .last_token = token_serial };
@@ -7033,7 +7076,9 @@ pub const Explorer = struct {
         const gen = self.search_gen.load(.acquire);
         if (self.word_render_cache.render(word, false, gen, allocator, out)) return;
         const render_start = out.items.len;
-        const hits = self.word_index.search(word);
+        const lookup = try self.word_index.search(word, allocator);
+        defer lookup.deinit(allocator);
+        const hits = lookup.items;
         try out.ensureUnusedCapacity(allocator, 64 + hits.len * 48);
         const w = cio.listWriter(out, allocator);
         try w.print("{d} hits for '{s}':\n", .{ hits.len, word });

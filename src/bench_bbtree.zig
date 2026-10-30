@@ -64,8 +64,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var random = std.Random.DefaultPrng.init(0xBB7EE);
     random.random().shuffle([]const u8, queries.items);
     for (queries.items) |q| {
-        const expected = baseline.search(q);
-        const actual = candidate.search(q);
+        const expected = (try baseline.search(q, a)).items;
+        const actual = (try candidate.search(q, a)).items;
         if (!std.mem.eql(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual))) return error.ExactParityFailed;
         const rank = candidate.bb_dictionary.?.lowerBound(q);
         var lo: usize = 0;
@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const index = if (is_bb) &candidate else &baseline;
             var start = cio.nanoTimestamp();
             for (0..5) |_| for (queries.items) |q| {
-                checksum +%= index.search(q).len;
+                checksum +%= (try index.search(q, a)).items.len;
             };
             const exact = @as(f64, @floatFromInt(cio.nanoTimestamp() - start)) / @as(f64, @floatFromInt(5 * queries.items.len));
             start = cio.nanoTimestamp();
@@ -106,12 +106,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("round={d} implementation={s} exact_ns={d:.2} prefix_ns={d:.2}\n", .{ round, if (is_bb) "bbtree" else "binary", exact, prefix });
         }
     }
-    // Exercise tree teardown before mmap promotion and verify retained postings.
+    // A write lands in the heap delta: the mmap and dictionary stay, base postings stay borrowed.
     try candidate.indexFile("bbtree-promotion-fixture.zig", "zzbbpromotionfixturezz");
-    if (candidate.bb_dictionary != null or candidate.mmap_data != null or candidate.search("zzbbpromotionfixturezz").len != 1) return error.PromotionFailed;
+    if (candidate.mmap_data == null or (try candidate.search("zzbbpromotionfixturezz", a)).items.len != 1) return error.OverlayFailed;
     for (baseline.word_dir) |off| {
         const key = bb.word(data, off);
-        if (!std.mem.eql(u8, std.mem.sliceAsBytes(baseline.search(key)), std.mem.sliceAsBytes(candidate.search(key)))) return error.PromotionParityFailed;
+        const expected = try baseline.search(key, a);
+        const actual = try candidate.search(key, a);
+        if (actual.owned.len != 0 or !std.mem.eql(u8, std.mem.sliceAsBytes(expected.items), std.mem.sliceAsBytes(actual.items))) return error.OverlayParityFailed;
     }
-    std.debug.print("promotion_parity=all checksum={d}\n", .{checksum});
+    std.debug.print("overlay_parity=all checksum={d}\n", .{checksum});
 }

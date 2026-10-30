@@ -550,7 +550,7 @@ test "word index: posting construction suppresses duplicate line hits" {
     try wi.indexFile("a.zig", "alpha alpha alpha_value alpha\nalpha\n");
     try wi.indexFile("b.zig", "alpha alpha\n");
 
-    const raw = wi.search("alpha");
+    const raw = (try wi.search("alpha", testing.allocator)).items;
     try testing.expectEqual(@as(usize, 3), raw.len);
     try testing.expectEqual(@as(u32, 1), raw[0].line_num);
     try testing.expectEqual(@as(u32, 2), raw[1].line_num);
@@ -801,7 +801,7 @@ test "watcher: parallel word-index shards match sequential (skip_file_words)" {
     try testing.expectEqual(explorer_seq.word_index.id_to_path.items.len, explorer_par.word_index.id_to_path.items.len);
     try testing.expectEqual(explorer_seq.word_index.total_tokens, explorer_par.word_index.total_tokens);
     for ([_][]const u8{ "parsetoken", "parse", "token", "handlerequest", "handle", "request", "todo", "std" }) |term| {
-        try testing.expectEqual(explorer_seq.word_index.search(term).len, explorer_par.word_index.search(term).len);
+        try testing.expectEqual((try explorer_seq.word_index.search(term, testing.allocator)).items.len, (try explorer_par.word_index.search(term, testing.allocator)).items.len);
     }
 
     // BM25 ranked-search parity: identical ordered result set (path + line).
@@ -1959,7 +1959,7 @@ test "perf regression: word index lookup under 100ns per query" {
         var timer = try cio.Timer.start();
         for (0..iters) |_| {
             for (queries) |q| {
-                _ = wi.search(q);
+                _ = (try wi.search(q, testing.allocator)).items;
             }
         }
         best_ns = @min(best_ns, timer.read());
@@ -3309,7 +3309,7 @@ test "issue-593: mmap trigram index — removeFile takes effect and re-index mas
     try testing.expectEqual(@as(u32, 2), any_idx.fileCount());
 }
 
-test "mmap word index: zero-copy load matches heap load and promotes on write" {
+test "mmap word index: zero-copy load matches heap load and keeps the base on write" {
     const alloc = testing.allocator;
     var wi = WordIndex.init(alloc);
     defer wi.deinit();
@@ -3332,11 +3332,11 @@ test "mmap word index: zero-copy load matches heap load and promotes on write" {
     var binary = WordIndex.mmapFromDiskWithDictionary(io, dir, alloc, false).?;
     defer binary.deinit();
     try testing.expect(binary.bb_dictionary == null);
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(binary.search("alphaToken")), std.mem.sliceAsBytes(mm.search("alphaToken")));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes((try binary.search("alphaToken", testing.allocator)).items), std.mem.sliceAsBytes((try mm.search("alphaToken", testing.allocator)).items));
 
     // search parity (exact)
-    try testing.expectEqual(heap.search("alphaToken").len, mm.search("alphaToken").len);
-    try testing.expect(mm.search("alphaToken").len >= 1);
+    try testing.expectEqual((try heap.search("alphaToken", testing.allocator)).items.len, (try mm.search("alphaToken", testing.allocator)).items.len);
+    try testing.expect((try mm.search("alphaToken", testing.allocator)).items.len >= 1);
 
     // searchDeduped parity + hitPath resolves through the mmap file table
     {
@@ -3364,14 +3364,114 @@ test "mmap word index: zero-copy load matches heap load and promotes on write" {
     try testing.expectEqual(heap.docLength(0), mm.docLength(0));
     try testing.expectEqual(heap.docLength(1), mm.docLength(1));
 
-    // Promote on write: a mutation materializes a heap index, then stays queryable.
+    // A write lands in the heap delta; the mmap base stays and keeps serving reads.
     try mm.indexFile("src/c.zig", "pub fn gammaToken() void {}\n");
-    try testing.expect(mm.mmap_data == null);
-    try testing.expect(mm.bb_dictionary == null);
+    try testing.expect(mm.mmap_data != null);
+    try testing.expect(mm.bb_dictionary != null);
     const g = try mm.searchDeduped("gammaToken", alloc);
     defer alloc.free(g);
     try testing.expectEqual(@as(usize, 1), g.len);
-    try testing.expect(mm.search("alphaToken").len >= 1); // pre-promote postings survived
+    try testing.expect((try mm.search("alphaToken", testing.allocator)).items.len >= 1);
+}
+
+test {
+    _ = @import("isolated_heap.zig");
+}
+
+fn wordHitSet(wi: *WordIndex, word: []const u8, arena: std.mem.Allocator) ![]const u8 {
+    const hits = try wi.search(word, arena);
+    var lines: std.ArrayList([]const u8) = .empty;
+    for (hits.items) |h| try lines.append(arena, try std.fmt.allocPrint(arena, "{s}:{d}", .{ wi.hitPath(h), h.line_num }));
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    return std.mem.join(arena, ",", lines.items);
+}
+
+test "mmap word index: edits overlay the base and match a rebuilt index" {
+    const alloc = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const a_old = "pub fn alphaToken() void { sharedWord(); }\n";
+    const a_new = "pub fn alphaRenamed() void {\n    sharedWord();\n}\n";
+    const b = "pub fn betaToken() void {\n    sharedWord();\n}\n";
+    const c = "const sharedWord = 1;\nconst gammaPrefixOne = 2;\n";
+    const d = "sharedWord gammaPrefixTwo\n";
+
+    var base = WordIndex.init(alloc);
+    defer base.deinit();
+    base.skip_file_words = true;
+    try base.indexFile("src/a.zig", a_old);
+    try base.indexFile("src/b.zig", b);
+    try base.indexFile("src/c.zig", c);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pb[0..try tmp.dir.realPathFile(io, ".", &pb)];
+    try base.writeToDisk(io, dir, null);
+
+    var mm = WordIndex.mmapFromDisk(io, dir, alloc).?;
+    defer mm.deinit();
+    try mm.indexFile("src/a.zig", a_new);
+    mm.removeFile("src/b.zig");
+    try mm.indexFile("src/d.zig", d);
+    try mm.indexFile("src/d.zig", d); // re-index a delta-only file
+    try testing.expect(mm.mmap_data != null);
+
+    var truth = WordIndex.init(alloc);
+    defer truth.deinit();
+    try truth.indexFile("src/a.zig", a_new);
+    try truth.indexFile("src/c.zig", c);
+    try truth.indexFile("src/d.zig", d);
+
+    // The merged postings stay sorted, so searchDeduped keeps its fast path.
+    const shared = try mm.search("sharedWord", arena);
+    try testing.expect(shared.owned.len > 0);
+    for (shared.items[1..], 0..) |h, i| {
+        const prev = shared.items[i];
+        try testing.expect(prev.doc_id < h.doc_id or (prev.doc_id == h.doc_id and prev.line_num < h.line_num));
+    }
+
+    var words: std.ArrayList([]const u8) = .empty;
+    var it_truth = truth.index.keyIterator();
+    while (it_truth.next()) |k| try words.append(arena, k.*);
+    var it_base = base.index.keyIterator();
+    while (it_base.next()) |k| try words.append(arena, k.*);
+    for (words.items) |w| {
+        try testing.expectEqualStrings(try wordHitSet(&truth, w, arena), try wordHitSet(&mm, w, arena));
+    }
+    try testing.expectEqual(truth.total_tokens, mm.total_tokens);
+    try testing.expectEqual(truth.rankedDocCount(), mm.rankedDocCount());
+
+    const pfx = try mm.searchPrefix("gammaprefix", alloc, 10);
+    defer alloc.free(pfx);
+    try testing.expectEqual(@as(usize, 2), pfx.len);
+    const capped = try mm.searchPrefix("gammaprefix", alloc, 1);
+    defer alloc.free(capped);
+    try testing.expectEqualSlices(@import("index.zig").WordHit, pfx[0..1], capped);
+
+    // A merged write of the overlay loads back as the rebuilt index.
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var pb2: [std.fs.max_path_bytes]u8 = undefined;
+    const dir2 = pb2[0..try tmp2.dir.realPathFile(io, ".", &pb2)];
+    var remapped = (try mm.writeToDiskAndMap(io, dir2, null, alloc)).?;
+    defer remapped.deinit();
+    var reread = WordIndex.readFromDisk(io, dir2, alloc).?;
+    defer reread.deinit();
+    for (words.items) |w| {
+        const expected = try wordHitSet(&truth, w, arena);
+        try testing.expectEqualStrings(expected, try wordHitSet(&reread, w, arena));
+        try testing.expectEqualStrings(expected, try wordHitSet(&remapped, w, arena));
+    }
+    try testing.expectEqual(truth.total_tokens, reread.total_tokens);
+    try testing.expectEqual(truth.docLength(truth.path_to_id.get("src/d.zig").?), reread.docLength(reread.path_to_id.get("src/d.zig").?));
+    try testing.expectEqual(@as(usize, 0), (try reread.search("betaToken", arena)).items.len);
 }
 
 test "issue-600: mmap_overlay writeToDisk persists overlay edits" {

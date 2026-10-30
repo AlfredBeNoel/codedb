@@ -3329,6 +3329,21 @@ test "call paths resolve from disk after contents are released" {
     for (expected, path) |name, step| try testing.expectEqualStrings(name, step.name);
 }
 
+test "removing a file drops the cached call graph" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("caller.zig", "pub fn alpha() void {\n    beta();\n}\n");
+    try explorer_inst.indexFile("callee.zig", "pub fn beta() void {}\n");
+    const before = (try explorer_inst.findCallPath("alpha", "beta", testing.allocator, 5)) orelse
+        return error.TestExpectedEqual;
+    testing.allocator.free(before);
+
+    explorer_inst.removeFile("callee.zig");
+    const after = try explorer_inst.findCallPath("alpha", "beta", testing.allocator, 5);
+    defer if (after) |steps| testing.allocator.free(steps);
+    try testing.expect(after == null);
+}
+
 test "trigramAdmits keeps admission for indexed files and caps new ones" {
     var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer_inst.deinit();

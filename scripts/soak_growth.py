@@ -32,7 +32,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from e2e_mcp_test import MCPProcess, do_initialize, all_tool_text
 
 SOURCE_SUFFIXES = {'.ts', '.tsx', '.js', '.jsx', '.py', '.md', '.json', '.sql', '.css'}
-COPY_EXCLUDES = ['node_modules', '.git', 'codedb.snapshot*', '__pycache__', '.next', '.turbo', '.expo', 'coverage']
+# The soak writes only under its own top-level dirs, so none may come from the source copy.
+GENERATED_DIRS = ['/soak', '/soak_alt_moved', '/soak_alt_added']
+COPY_EXCLUDES = ['node_modules', '.git', 'codedb.snapshot*', '__pycache__', '.next', '.turbo', '.expo', 'coverage',
+                 *GENERATED_DIRS]
 WORD_RE = re.compile(rb'[A-Za-z_][A-Za-z0-9_]{5,30}')
 
 

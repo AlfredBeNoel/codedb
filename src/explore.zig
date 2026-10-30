@@ -2159,15 +2159,7 @@ pub const Explorer = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.bumpSearchGen();
-        if (self.call_graph) |*cg| {
-            cg.deinit(self.allocator);
-            self.call_graph = null;
-            self.call_graph_exact = false;
-        }
-        if (self.call_centrality) |*cc| {
-            cc.deinit();
-            self.call_centrality = null;
-        }
+        self.dropCallGraphLocked();
 
         const outline_gop = try self.outlines.getOrPut(path);
         const is_new = !outline_gop.found_existing;
@@ -3108,10 +3100,25 @@ pub const Explorer = struct {
         self.word_index_persisted_generation = self.word_index_generation;
     }
 
+    /// Caller holds `mu` exclusively. Centrality keys borrow outline keys, so
+    /// every outline change or removal must drop the graph first.
+    fn dropCallGraphLocked(self: *Explorer) void {
+        if (self.call_graph) |*cg| {
+            cg.deinit(self.allocator);
+            self.call_graph = null;
+            self.call_graph_exact = false;
+        }
+        if (self.call_centrality) |*cc| {
+            cc.deinit();
+            self.call_centrality = null;
+        }
+    }
+
     pub fn removeFile(self: *Explorer, path: []const u8) void {
         self.mu.lock();
         defer self.mu.unlock();
         self.bumpSearchGen();
+        self.dropCallGraphLocked();
         if (!self.word_index_complete) {
             self.word_index_can_load_from_disk = false;
         } else {

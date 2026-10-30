@@ -3319,6 +3319,12 @@ pub const Explorer = struct {
     pub fn getContent(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) !?[]u8 {
         self.mu.lockShared();
         defer self.mu.unlockShared();
+        return self.getContentLocked(path, allocator);
+    }
+
+    /// getContent for a caller already holding `mu` shared. A nested lockShared
+    /// deadlocks once a writer queues between the two acquisitions.
+    pub fn getContentLocked(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) !?[]u8 {
         const ref = self.readContentForSearch(path, allocator) orelse return null;
         if (ref.owned) return @constCast(ref.data);
         return try allocator.dupe(u8, ref.data);

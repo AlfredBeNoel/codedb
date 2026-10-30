@@ -4949,7 +4949,7 @@ fn handleContext(
             // each hit. Indexed cache hits common files in ~µs; arena owns the
             // dupe so we don't leak.
             const file_content: ?[]const u8 = blk: {
-                const got = explorer.getContent(f.path, A) catch break :blk null;
+                const got = explorer.getContentLocked(f.path, A) catch break :blk null;
                 break :blk got;
             };
             for (f.top) |h| {

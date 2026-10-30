@@ -81,6 +81,7 @@ class MCPProcess:
             cwd=cwd,
             env=env,
             text=True,
+            errors="replace",
             bufsize=1,
         )
         self._id = 1

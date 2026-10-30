@@ -480,11 +480,10 @@ const ProjectCache = struct {
 
         loadProjectTrigramFromDiskIfPresent(io, &new_entry.explorer, canonical_root, self.alloc);
 
-        // Release raw file contents retained by the snapshot load — outlines,
-        // trigram index, and word index are sufficient for all query tools.
+        // Free heap copies of file contents; slices into the snapshot mmap stay.
         const fc = new_entry.explorer.outlines.count();
         if (fc > 1000) {
-            new_entry.explorer.releaseContents();
+            new_entry.explorer.releaseOwnedContents();
             new_entry.explorer.releaseSecondaryIndexes();
         }
 
@@ -6091,7 +6090,7 @@ fn handleIndex(
         if (snapshot_mod.loadSnapshotValidated(io, snapshot_path, abs_path, default_explorer, default_store, alloc)) {
             loadProjectTrigramFromDiskIfPresent(io, default_explorer, abs_path, alloc);
             if (default_explorer.outlines.count() > 1000) {
-                default_explorer.releaseContents();
+                default_explorer.releaseOwnedContents();
                 default_explorer.releaseSecondaryIndexes();
             }
             setScanState(.ready);

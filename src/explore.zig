@@ -2121,6 +2121,16 @@ pub const Explorer = struct {
         self.line_offsets.clear();
     }
 
+    /// Keeps contents borrowed from the snapshot mmap: they cost no heap, and
+    /// dropping them makes every later read copy the file from disk into heap.
+    pub fn releaseOwnedContents(self: *Explorer) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.contents.clearOwned();
+        self.content_hashes.clear();
+        self.line_offsets.clear();
+    }
+
     pub fn releaseSecondaryIndexes(self: *Explorer) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -6046,7 +6056,9 @@ pub const Explorer = struct {
             self.call_graph_exact = false;
         }
 
-        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        // Page-backed: this arena can hold every uncached file body at once, and
+        // malloc keeps freed blocks that large dirty instead of returning them.
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena_state.deinit();
         const a = arena_state.allocator();
 
@@ -6056,6 +6068,8 @@ pub const Explorer = struct {
         var node_language_group: std.ArrayList(u8) = .empty;
         var funcs: std.ArrayList(codegraph.FuncInput) = .empty;
         var name_to_ids = std.StringHashMap(std.ArrayList(codegraph.NodeId)).init(a);
+        var offs: std.ArrayList(usize) = .empty;
+        defer offs.deinit(allocator);
 
         var it = self.outlines.iterator();
         while (it.next()) |entry| {
@@ -6070,10 +6084,10 @@ pub const Explorer = struct {
             var import_bindings: std.ArrayList(codegraph.ImportBinding) = .empty;
             import_bindings.appendSlice(a, direct_import_bindings) catch return;
             const file_func_start = funcs.items.len;
-            var offs: std.ArrayList(usize) = .empty;
-            offs.append(a, 0) catch continue;
+            offs.clearRetainingCapacity();
+            offs.append(allocator, 0) catch continue;
             for (content, 0..) |ch, i| {
-                if (ch == '\n') offs.append(a, i + 1) catch break;
+                if (ch == '\n') offs.append(allocator, i + 1) catch break;
             }
             const nlines = offs.items.len;
             for (entry.value_ptr.symbols.items) |sym| {

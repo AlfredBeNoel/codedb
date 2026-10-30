@@ -366,7 +366,7 @@ pub fn compactMcpReadyMemory(
         (explorer.wordIndexCanLoadFromDisk() and wordIndexDiskMatches(io, explorer, data_dir, current_git_head, allocator));
 
     if (can_release_contents) {
-        explorer.releaseContents();
+        explorer.releaseOwnedContents();
     }
     explorer.releaseSecondaryIndexes();
 

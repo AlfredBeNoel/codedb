@@ -474,7 +474,7 @@ pub fn coldLoadOrScan(
     data_dir: []const u8,
     freq_table_heap: *?*[256][256]u16,
 ) !void {
-    if (std.mem.eql(u8, cmd, "mcp")) return;
+    if (std.mem.eql(u8, cmd, "mcp") or std.mem.eql(u8, cmd, "mcp-server")) return;
 
     const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
 

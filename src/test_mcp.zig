@@ -33,6 +33,7 @@ const commands_mod = @import("commands.zig");
 const mcp_json = @import("mcp_json.zig");
 comptime {
     _ = @import("config.zig");
+    _ = @import("mcp_shared.zig");
 }
 
 fn setTestProjectRoot(explorer: *Explorer) !void {
@@ -4925,4 +4926,68 @@ test "OpenWispr: callers excludes Swift declarations, locals, and parameter labe
     try testing.expect(std.mem.indexOf(u8, out.items, "calls.swift:4") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "calls.swift:5") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "calls.swift:6") != null);
+}
+
+const PeerCtx = struct {
+    store: *Store,
+    explorer: *Explorer,
+    agents: *AgentRegistry,
+    telem: *telemetry_mod.Telemetry,
+    shutdown: *std.atomic.Value(bool),
+};
+
+fn runTestPeer(ctx: PeerCtx, conn: c_int) void {
+    defer _ = std.c.close(conn);
+    var broken = std.atomic.Value(bool).init(false);
+    const in: std.Io.File = .{ .handle = conn, .flags = .{ .nonblocking = false } };
+    const rpc: mcp_mod.RpcOut = .{ .file = .{ .handle = conn }, .broken = &broken };
+    mcp_mod.runPeer(io, testing.allocator, in, rpc, ctx.store, ctx.explorer, ctx.agents, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY, ctx.telem, null, ctx.shutdown);
+}
+
+test "mcp shared: concurrent peer sessions keep their own ids and broken state" {
+    cio.ignoreSigpipe();
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+    var telem = telemetry_mod.Telemetry.init(io, "/tmp", testing.allocator, true);
+    defer telem.deinit();
+    var shutdown = std.atomic.Value(bool).init(false);
+    const ctx = PeerCtx{ .store = &store, .explorer = &explorer, .agents = &agents, .telem = &telem, .shutdown = &shutdown };
+
+    var a: [2]std.c.fd_t = undefined;
+    var b: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &a));
+    try testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &b));
+    const peer_a = try std.Thread.spawn(.{}, runTestPeer, .{ ctx, a[1] });
+    const peer_b = try std.Thread.spawn(.{}, runTestPeer, .{ ctx, b[1] });
+
+    const init_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}\n";
+    // Client B leaves before its reply, so the server's write to B fails.
+    try testing.expect(cli_proxy_mod.cliWriteFull(b[0], init_req));
+    _ = std.c.close(b[0]);
+    peer_b.join();
+
+    try testing.expect(cli_proxy_mod.cliWriteFull(a[0], init_req ++
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n"));
+    _ = std.c.shutdown(a[0], std.c.SHUT.WR);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    var buf: [16 * 1024]u8 = undefined;
+    while (cli_proxy_mod.connRead(a[0], &buf)) |n| {
+        if (n == 0) break;
+        try got.appendSlice(testing.allocator, buf[0..n]);
+    }
+    _ = std.c.close(a[0]);
+    peer_a.join();
+
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, got.items, "\n"));
+    try testing.expect(std.mem.indexOf(u8, got.items, "\"serverInfo\"") != null);
+    try testing.expect(std.mem.indexOf(u8, got.items, "\"codedb_context\"") != null);
+    try testing.expect(!mcp_mod.stdout_broken.load(.acquire));
 }

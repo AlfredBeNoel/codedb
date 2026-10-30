@@ -134,6 +134,7 @@ const loadUserConfig = bootstrap.loadUserConfig;
 const getDataDir = bootstrap.getDataDir;
 
 const commands = @import("commands.zig");
+const mcp_shared = @import("mcp_shared.zig");
 fn mainImpl(argv: []const [*:0]const u8) !void {
     // Use c_allocator (libc malloc) — better page reclamation than GPA
     const allocator = std.heap.c_allocator;
@@ -465,6 +466,15 @@ fn mainImpl(argv: []const [*:0]const u8) !void {
         break :blk Config.default;
     };
 
+    // One index per root: hand this session to the shared server. Null means
+    // it could not be reached before any stdin byte was read, so serve here.
+    if (std.mem.eql(u8, cmd, "mcp") and !mcp_deferred_root and cio.posixGetenv("CODEDB_LAZY_MCP") == null) {
+        if (mcp_shared.forward(io, allocator, abs_root, cfg, no_telemetry, explicit_config)) |code| {
+            out.flush();
+            std.process.exit(code);
+        }
+    }
+
     var store = Store.init(allocator);
     store.max_versions = cfg.max_versions;
     defer store.deinit();
@@ -529,6 +539,8 @@ fn mainImpl(argv: []const [*:0]const u8) !void {
         try commands.runServe(&ctx);
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         try commands.runMcp(&ctx);
+    } else if (std.mem.eql(u8, cmd, "mcp-server")) {
+        try commands.runMcpServer(&ctx);
     } else if (bootstrap.commandRebuildsIndex(cmd)) {
         // `reindex` is the public spelling; `index` remains a compatibility
         // alias. coldLoadOrScan above already

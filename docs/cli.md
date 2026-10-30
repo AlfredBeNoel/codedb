@@ -162,6 +162,9 @@ codedb-cli stop                       # stop daemon
 | `CODEDB_EMBEDDINGS_TOKEN` | unset | Optional legacy bearer token for protected/custom endpoints; the hosted lane enrolls automatically |
 | `CODEDB_EMBEDDINGS_TIMEOUT_MS` | `15000` | Per-request deadline in milliseconds (10-120000) |
 | `CODEDB_SEMANTIC_INDEX_CONCURRENCY` | `8` | Parallel 100-item index batches (clamped to 1-8) |
+| `CODEDB_MCP_SHARED` | on | `0` makes `codedb mcp` serve in-process instead of through the shared per-root server ([docs/mcp.md](mcp.md#shared-server-one-index-per-project-root)) |
+| `CODEDB_MCP_SOCKET_DIR` | `~/.codedb/run` | Socket, lock and log directory of the shared MCP servers |
+| `CODEDB_MCP_IDLE_MS` | `300000` | Idle time before a shared MCP server exits |
 
 ## Performance
 

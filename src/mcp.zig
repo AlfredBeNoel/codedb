@@ -336,6 +336,9 @@ const ProjectCache = struct {
     default_deps_cache: DepsCache,
     default_semantic_cache: semantic_index_mod.SearchCache,
     content_cache_capacity: u32,
+    /// The default explorer stays rooted at `default_path` for the session,
+    /// so a `project` naming that root can use it instead of a snapshot copy.
+    default_root_fixed: bool = false,
 
     fn init(alloc_: std.mem.Allocator, default_path_: []const u8, content_cache_capacity_: u32) ProjectCache {
         return .{
@@ -410,7 +413,8 @@ const ProjectCache = struct {
         default_exp: *Explorer,
         default_store: *Store,
     ) !ProjectCtx {
-        const raw_path = path orelse return ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache, .deps_cache = &self.default_deps_cache, .semantic_cache = &self.default_semantic_cache };
+        const default_ctx = ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache, .deps_cache = &self.default_deps_cache, .semantic_cache = &self.default_semantic_cache };
+        const raw_path = path orelse return default_ctx;
         const parsed_path = local_uri.parseRootReference(self.alloc, raw_path) catch return error.PathNotAllowed;
         defer self.alloc.free(parsed_path);
 
@@ -419,6 +423,8 @@ const ProjectCache = struct {
         defer if (candidate_live) candidate.deinit();
         try candidate.setRoot(io, parsed_path);
         const canonical_root = candidate.root_path orelse return error.PathNotAllowed;
+        // Each shared-server session would otherwise load its own copy of the root.
+        if (self.default_root_fixed and std.mem.eql(u8, canonical_root, self.default_path)) return default_ctx;
 
         self.mu.lock();
         defer self.mu.unlock();
@@ -587,7 +593,8 @@ pub const BenchContext = struct {
         agents: *AgentRegistry,
         telem: *telemetry_mod.Telemetry,
     ) void {
-        handleCall(io, alloc, root, stdout, id, store, explorer, agents, &self.cache, telem, null, null, null, true, &.{});
+        var broken = std.atomic.Value(bool).init(false);
+        handleCall(io, alloc, root, .{ .file = stdout, .broken = &broken }, id, store, explorer, agents, &self.cache, telem, null, null, null, true, &.{});
     }
 
     pub fn runToolCall(
@@ -1069,6 +1076,17 @@ pub const dead_client_poll_ms: u64 = 1000;
 
 pub var stdout_broken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
+/// Where one session writes JSON-RPC lines. `broken` belongs to that session,
+/// so a dead shared-server client ends only its own session.
+pub const RpcOut = struct {
+    file: cio.File,
+    broken: *std.atomic.Value(bool),
+
+    fn send(self: RpcOut, line: []const u8) void {
+        self.file.writeAll(line) catch self.broken.store(true, .release);
+    }
+};
+
 // ── Serve-first scan state (issue #207) ─────────────────────────────────────
 //
 // MCP serves immediately on startup; the file walk + index build runs in a
@@ -1119,7 +1137,7 @@ fn waitForScanReady(timeout_ms: u64) void {
 
 const Session = struct {
     alloc: std.mem.Allocator,
-    stdout: cio.File,
+    rpc: RpcOut,
     next_id: i64 = 100,
     client_supports_roots: bool = false,
     client_roots_list_changed: bool = false,
@@ -1269,11 +1287,30 @@ pub fn run(
     deferred_scan: ?*DeferredScan,
     shutdown: *std.atomic.Value(bool),
 ) void {
-    const stdout = cio.File.stdout();
-    const stdin = std.Io.File.stdin();
+    const stdio: RpcOut = .{ .file = cio.File.stdout(), .broken = &stdout_broken };
+    runPeer(io, alloc, std.Io.File.stdin(), stdio, store, explorer, agents, default_path, content_cache_capacity, telem, deferred_scan, shutdown);
+}
+
+/// One MCP session reading `in` and writing `rpc`: stdio for `codedb mcp`,
+/// one client socket per session of the shared `mcp-server`.
+pub fn runPeer(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    in: std.Io.File,
+    rpc: RpcOut,
+    store: *Store,
+    explorer: *Explorer,
+    agents: *AgentRegistry,
+    default_path: []const u8,
+    content_cache_capacity: u32,
+    telem: *telemetry_mod.Telemetry,
+    deferred_scan: ?*DeferredScan,
+    shutdown: *std.atomic.Value(bool),
+) void {
     last_activity.store(cio.milliTimestamp(), .release);
 
     var cache = ProjectCache.init(alloc, default_path, content_cache_capacity);
+    cache.default_root_fixed = deferred_scan == null;
     defer cache.deinit();
 
     // Build the `tools/list` payload. The discriminated `oneOf` on the
@@ -1330,16 +1367,16 @@ pub fn run(
     const profile_explicit = cio.posixGetenv("CODEDB_TOOLS_PROFILE") != null;
     var session = Session{
         .alloc = alloc,
-        .stdout = stdout,
+        .rpc = rpc,
         .deferred_scan = deferred_scan,
     };
     defer session.deinit();
 
     var read_buf: [4096]u8 = undefined;
-    var stdin_reader = stdin.reader(io, &read_buf);
+    var in_reader = in.reader(io, &read_buf);
 
-    while (!stdout_broken.load(.acquire) and !shutdown.load(.acquire)) {
-        const msg = mcpj.readLineBuf(alloc, &stdin_reader.interface) orelse break;
+    while (!rpc.broken.load(.acquire) and !shutdown.load(.acquire)) {
+        const msg = mcpj.readLineBuf(alloc, &in_reader.interface) orelse break;
         last_activity.store(cio.milliTimestamp(), .release);
         defer alloc.free(msg);
 
@@ -1347,13 +1384,13 @@ pub fn run(
         if (input.len == 0) continue;
 
         const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
-            writeError(alloc, stdout, null, -32700, "Parse error");
+            writeError(alloc, rpc, null, -32700, "Parse error");
             continue;
         };
         defer parsed.deinit();
 
         if (parsed.value != .object) {
-            writeError(alloc, stdout, null, -32600, "Invalid Request");
+            writeError(alloc, rpc, null, -32600, "Invalid Request");
             continue;
         }
 
@@ -1376,7 +1413,7 @@ pub fn run(
         // UnsupportedProtocolVersionError instead of guessing.
         if (!is_notification) {
             if (unsupportedMetaProtocolVersion(root)) |requested| {
-                writeUnsupportedProtocolVersionError(alloc, stdout, id, requested);
+                writeUnsupportedProtocolVersionError(alloc, rpc, id, requested);
                 continue;
             }
         }
@@ -1415,16 +1452,16 @@ pub fn run(
                     break :blk if (modern_results) tools_list else "{\"tools\":[]}";
                 };
                 defer if (resp_owned) alloc.free(resp);
-                writeResultVersioned(alloc, stdout, id, resp, modern_results);
+                writeResultVersioned(alloc, rpc, id, resp, modern_results);
             }
         } else if (mcpj.eql(method, "tools/call")) {
-            handleCall(io, alloc, root, stdout, id, store, explorer, agents, &cache, telem, session.deferred_scan, &session.governor, session.client_name, requestUsesModernResults(root, session.modern_results), session.roots.items);
+            handleCall(io, alloc, root, rpc, id, store, explorer, agents, &cache, telem, session.deferred_scan, &session.governor, session.client_name, requestUsesModernResults(root, session.modern_results), session.roots.items);
         } else if (mcpj.eql(method, "ping")) {
-            if (!is_notification) writeResultVersioned(alloc, stdout, id, "{}", requestUsesModernResults(root, session.modern_results));
+            if (!is_notification) writeResultVersioned(alloc, rpc, id, "{}", requestUsesModernResults(root, session.modern_results));
         } else if (mcpj.eql(method, "server/discover")) {
-            if (!is_notification) writeResult(alloc, stdout, id, discover_result);
+            if (!is_notification) writeResult(alloc, rpc, id, discover_result);
         } else {
-            if (!is_notification) writeError(alloc, stdout, id, -32601, "Method not found");
+            if (!is_notification) writeError(alloc, rpc, id, -32601, "Method not found");
         }
     }
 }
@@ -1470,7 +1507,7 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
         \\{{"protocolVersion":"{s}","capabilities":{{"tools":{{"listChanged":false}},"extensions":{{}}}},"serverInfo":{{"name":"codedb","version":"{s}"}},"instructions":"{s}"}}
     , .{ negotiated, release_info.semver, mcp_instructions }) catch return;
     defer s.alloc.free(init_result);
-    writeResultVersioned(s.alloc, s.stdout, id, init_result, s.modern_results);
+    writeResultVersioned(s.alloc, s.rpc, id, init_result, s.modern_results);
 }
 /// Versions of the MCP spec this server has been verified against. Listed
 /// newest-first because clients that send a newer version than we know
@@ -1552,7 +1589,7 @@ pub fn requestUsesModernResults(root: *const std.json.ObjectMap, fallback: bool)
     return std.mem.eql(u8, version, "2026-07-28");
 }
 
-fn writeUnsupportedProtocolVersionError(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, requested: []const u8) void {
+fn writeUnsupportedProtocolVersionError(alloc: std.mem.Allocator, rpc: RpcOut, id: ?std.json.Value, requested: []const u8) void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
@@ -1560,17 +1597,14 @@ fn writeUnsupportedProtocolVersionError(alloc: std.mem.Allocator, stdout: cio.Fi
     buf.appendSlice(alloc, ",\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"requested\":\"") catch return;
     mcpj.writeEscaped(alloc, &buf, requested);
     buf.appendSlice(alloc, "\",\"supported\":" ++ supported_versions_json ++ "}}}\n") catch return;
-    stdout.writeAll(buf.items) catch {
-        stdout_broken.store(true, .release);
-        return;
-    };
+    rpc.send(buf.items);
 }
 
 fn requestRoots(s: *Session) void {
     const rid = s.next_id;
     s.next_id += 1;
     s.pending_roots_id = rid;
-    writeRequest(s.alloc, s.stdout, rid, "roots/list", "{}");
+    writeRequest(s.alloc, s.rpc, rid, "roots/list", "{}");
 }
 
 fn handleResponse(io: std.Io, s: *Session, root: *const std.json.ObjectMap) void {
@@ -1627,7 +1661,7 @@ fn parseRoots(io: std.Io, s: *Session, result: *const std.json.ObjectMap) void {
     }
 }
 
-fn writeRequest(alloc: std.mem.Allocator, stdout: cio.File, id: i64, method: []const u8, params: []const u8) void {
+fn writeRequest(alloc: std.mem.Allocator, rpc: RpcOut, id: i64, method: []const u8, params: []const u8) void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
@@ -1639,17 +1673,14 @@ fn writeRequest(alloc: std.mem.Allocator, stdout: cio.File, id: i64, method: []c
     buf.appendSlice(alloc, "\",\"params\":") catch return;
     buf.appendSlice(alloc, params) catch return;
     buf.appendSlice(alloc, "}\n") catch return;
-    stdout.writeAll(buf.items) catch {
-        stdout_broken.store(true, .release);
-        return;
-    };
+    rpc.send(buf.items);
 }
 
 fn handleCall(
     io: std.Io,
     alloc: std.mem.Allocator,
     root: *const std.json.ObjectMap,
-    stdout: cio.File,
+    rpc: RpcOut,
     id: ?std.json.Value,
     store: *Store,
     explorer: *Explorer,
@@ -1665,24 +1696,24 @@ fn handleCall(
     const is_notification = id == null;
 
     const params_val = root.get("params") orelse {
-        if (!is_notification) writeError(alloc, stdout, id, -32602, "Missing params");
+        if (!is_notification) writeError(alloc, rpc, id, -32602, "Missing params");
         return;
     };
     if (params_val != .object) {
-        if (!is_notification) writeError(alloc, stdout, id, -32602, "params must be object");
+        if (!is_notification) writeError(alloc, rpc, id, -32602, "params must be object");
         return;
     }
     const params = &params_val.object;
 
     const name = getStr(params, "name") orelse {
-        if (!is_notification) writeError(alloc, stdout, id, -32602, "Missing tool name");
+        if (!is_notification) writeError(alloc, rpc, id, -32602, "Missing tool name");
         return;
     };
     var args_value: std.json.Value = .{ .object = .empty };
     var inline_args: std.json.ObjectMap = .empty;
     defer inline_args.deinit(alloc);
     const args = selectDirectCallArgs(alloc, params, &args_value, &inline_args) catch |err| {
-        if (!is_notification) writeError(alloc, stdout, id, -32602, switch (err) {
+        if (!is_notification) writeError(alloc, rpc, id, -32602, switch (err) {
             error.ArgumentsMustBeObject => "arguments must be object",
             error.ArgsMustBeObject => "args must be object",
             error.OutOfMemory => "out of memory",
@@ -1691,7 +1722,7 @@ fn handleCall(
     };
 
     const tool = std.meta.stringToEnum(Tool, name) orelse {
-        if (!is_notification) writeError(alloc, stdout, id, -32602, "Unknown tool");
+        if (!is_notification) writeError(alloc, rpc, id, -32602, "Unknown tool");
         return;
     };
 
@@ -1701,12 +1732,12 @@ fn handleCall(
             ds.query_requested.store(true, .release);
             _ = triggerDeferredScanWithFallback(ds, roots, ds.fallback_cwd);
             if (!ds.triggered.load(.acquire)) {
-                if (!is_notification) writeError(alloc, stdout, id, -32000, "No indexable root; send workspace roots or pass an explicit project.");
+                if (!is_notification) writeError(alloc, rpc, id, -32000, "No indexable root; send workspace roots or pass an explicit project.");
                 return;
             }
             waitForScanReady(30_000);
             if (getScanState() != .ready) {
-                if (!is_notification) writeError(alloc, stdout, id, -32000, "Index is still starting; retry the tool request.");
+                if (!is_notification) writeError(alloc, rpc, id, -32000, "Index is still starting; retry the tool request.");
                 return;
             }
         }
@@ -1791,7 +1822,7 @@ fn handleCall(
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(alloc);
     if (!assembleMcpContentEnvelope(alloc, summary.items, out.items, guidance.items, is_error, &result)) return;
-    writeResultVersioned(alloc, stdout, id, result.items, modern_results);
+    writeResultVersioned(alloc, rpc, id, result.items, modern_results);
 }
 
 fn isDirectCallAdminKey(key: []const u8) bool {
@@ -7243,21 +7274,18 @@ pub fn assembleJsonRpcResultVersioned(alloc: std.mem.Allocator, id: ?std.json.Va
     return true;
 }
 
-fn writeResult(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, result: []const u8) void {
-    writeResultVersioned(alloc, stdout, id, result, true);
+fn writeResult(alloc: std.mem.Allocator, rpc: RpcOut, id: ?std.json.Value, result: []const u8) void {
+    writeResultVersioned(alloc, rpc, id, result, true);
 }
 
-fn writeResultVersioned(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, result: []const u8, modern_results: bool) void {
+fn writeResultVersioned(alloc: std.mem.Allocator, rpc: RpcOut, id: ?std.json.Value, result: []const u8, modern_results: bool) void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     if (!assembleJsonRpcResultVersioned(alloc, id, result, &buf, modern_results)) return;
-    stdout.writeAll(buf.items) catch {
-        stdout_broken.store(true, .release);
-        return;
-    };
+    rpc.send(buf.items);
 }
 
-fn writeError(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, code: i32, msg: []const u8) void {
+fn writeError(alloc: std.mem.Allocator, rpc: RpcOut, id: ?std.json.Value, code: i32, msg: []const u8) void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
@@ -7268,15 +7296,8 @@ fn writeError(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, c
     buf.appendSlice(alloc, cs) catch return;
     buf.appendSlice(alloc, ",\"message\":\"") catch return;
     mcpj.writeEscaped(alloc, &buf, msg);
-    buf.appendSlice(alloc, "\"}}") catch return;
-    stdout.writeAll(buf.items) catch {
-        stdout_broken.store(true, .release);
-        return;
-    };
-    stdout.writeAll("\n") catch {
-        stdout_broken.store(true, .release);
-        return;
-    };
+    buf.appendSlice(alloc, "\"}}\n") catch return;
+    rpc.send(buf.items);
 }
 /// Fast JSON string escaper: batch-copies runs of safe characters via
 /// appendSlice instead of the per-byte append in mcpj.writeEscaped.
@@ -8003,6 +8024,27 @@ test "issue-353: project cache invalidation reloads newly written snapshots" {
     const new_ctx = try cache.get(io, project_path, &default_explorer, &default_store);
     try testing.expect(!new_ctx.explorer.outlines.contains("src/old.zig"));
     try testing.expect(new_ctx.explorer.outlines.contains("src/new.zig"));
+}
+
+test "project cache: a project naming the fixed default root uses the default index" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPathFile(io, ".", &root_buf)];
+
+    var default_explorer = Explorer.init(testing.allocator, explore_mod.Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer default_explorer.deinit();
+    try default_explorer.setRoot(io, root);
+    var default_store = Store.init(testing.allocator);
+    defer default_store.deinit();
+
+    var cache = ProjectCache.init(testing.allocator, root, explore_mod.Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer cache.deinit();
+    cache.default_root_fixed = true;
+    const ctx = try cache.get(io, root, &default_explorer, &default_store);
+    try testing.expect(ctx.explorer == &default_explorer);
+    try testing.expect(ctx.store == &default_store);
 }
 
 test "codedb_snapshot cache reuses output until store seq changes" {

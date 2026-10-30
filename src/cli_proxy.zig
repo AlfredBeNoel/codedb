@@ -427,7 +427,7 @@ fn createCliPipeInstance(pipe_name: [:0]const u8, first_instance: bool, sa_pipe:
 /// Fill a sockaddr.un for `path` (which must be NUL-terminatable into sun_path).
 /// Returns the struct plus the byte length to pass to bind/connect. Path is
 /// guaranteed short by cliSocketPath, but we guard the copy regardless.
-fn cliFillSockaddr(path: []const u8) ?SockAddr {
+pub fn cliFillSockaddr(path: []const u8) ?SockAddr {
     var addr: std.c.sockaddr.un = .{ .family = std.c.AF.UNIX, .path = undefined };
     if (path.len + 1 > addr.path.len) return null;
     @memcpy(addr.path[0..path.len], path);
@@ -442,7 +442,7 @@ fn cliFillSockaddr(path: []const u8) ?SockAddr {
 /// Returns false on EOF-before-full or a hard error (EINTR is retried).
 const CliConn = if (builtin.os.tag == .windows) win.HANDLE else c_int;
 
-fn connRead(conn: CliConn, buf: []u8) ?usize {
+pub fn connRead(conn: CliConn, buf: []u8) ?usize {
     if (builtin.os.tag == .windows) {
         var got: u32 = 0;
         const want: u32 = @intCast(@min(buf.len, std.math.maxInt(u32)));
@@ -482,7 +482,7 @@ fn cliReadFull(conn: CliConn, buf: []u8) bool {
 
 /// Write all of `data` to a blocking fd, looping over short/partial writes.
 /// Returns false on a hard error (EINTR is retried).
-fn cliWriteFull(conn: CliConn, data: []const u8) bool {
+pub fn cliWriteFull(conn: CliConn, data: []const u8) bool {
     var off: usize = 0;
     while (off < data.len) {
         const n = connWrite(conn, data[off..]) orelse return false;
@@ -537,13 +537,13 @@ pub fn daemonLockAvailable(data_dir: []const u8) bool {
 }
 
 /// Named sockaddr.un bundle: the struct plus the byte length for bind()/connect().
-const SockAddr = struct { addr: std.c.sockaddr.un, len: std.c.socklen_t };
+pub const SockAddr = struct { addr: std.c.sockaddr.un, len: std.c.socklen_t };
 
 /// One attempt to OWN the project socket: socket() + bind() + chmod 0600 +
 /// listen(). Returns the listening fd, or null if the path is already taken or
 /// a syscall failed (the fd is closed on any failure). Never unlinks — the
 /// caller decides whether a taken path is stale.
-fn cliBindListen(sa: SockAddr, sock_path_z: [:0]const u8) ?c_int {
+pub fn cliBindListen(sa: SockAddr, sock_path_z: [:0]const u8, backlog: c_uint) ?c_int {
     const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
     if (fd < 0) return null;
     var sa_mut = sa;
@@ -555,7 +555,7 @@ fn cliBindListen(sa: SockAddr, sock_path_z: [:0]const u8) ?c_int {
     // ignores fchmod() on a socket fd. Safe before listen() — no client can
     // connect yet. Non-fatal.
     _ = std.c.chmod(sock_path_z.ptr, 0o600);
-    if (std.c.listen(fd, 16) != 0) {
+    if (std.c.listen(fd, backlog) != 0) {
         _ = std.c.close(fd);
         return null;
     }
@@ -612,12 +612,12 @@ pub fn cliAcquireListener(sock_path: []const u8, retry: bool, retry_interval_ms:
     const sa = cliFillSockaddr(sock_path) orelse return null;
     var yield_sent = false;
     while (true) {
-        if (cliBindListen(sa, sock_path_z)) |fd| return fd;
+        if (cliBindListen(sa, sock_path_z, 16)) |fd| return fd;
         // Bind failed: the path exists. Clear it only when no one is listening
         // (stale node), never when a live owner still holds it.
         if (!cliSocketLive(sa)) {
             _ = std.c.unlink(sock_path_z.ptr);
-            if (cliBindListen(sa, sock_path_z)) |fd| return fd;
+            if (cliBindListen(sa, sock_path_z, 16)) |fd| return fd;
         } else if (retry and !yield_sent) {
             yield_sent = true;
             cliSendYieldRequest(sa);
@@ -1150,7 +1150,7 @@ fn cliConnect(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8, da
 
 extern "c" fn getpeereid(fd: c_int, uid: *std.c.uid_t, gid: *std.c.gid_t) c_int;
 
-fn unixPeerTrusted(fd: c_int) bool {
+pub fn unixPeerTrusted(fd: c_int) bool {
     if (comptime builtin.os.tag == .linux) {
         const Credentials = extern struct { pid: std.c.pid_t, uid: std.c.uid_t, gid: std.c.gid_t };
         var peer: Credentials = undefined;

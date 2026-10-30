@@ -194,7 +194,7 @@ fn connectOrSpawn(io: std.Io, key: u64, spawn: SpawnArgs) Unavailable!c_int {
                 defer _ = std.c.close(lock_fd);
                 // The lock is free again only if the server we started died.
                 if (spawned) return error.ServerExitedBeforeListening;
-                if (!spawnServer(spawn, lock_fd, log)) return error.SpawnFailed;
+                if (!spawnServer(spawn, key, lock_fd, log)) return error.SpawnFailed;
                 spawned = true;
             },
         }
@@ -298,15 +298,17 @@ fn copyStdinToServer(conn: c_int, stdin_done: *std.atomic.Value(bool)) void {
 
 /// Double-forks `codedb <root> mcp-server` so it is reparented to init and
 /// outlives this client, and hands it `lock_fd` as fd 3 so it owns the key.
-fn spawnServer(spawn: SpawnArgs, lock_fd: c_int, log_path: [:0]const u8) bool {
+fn spawnServer(spawn: SpawnArgs, key: u64, lock_fd: c_int, log_path: [:0]const u8) bool {
     const self_exe = std.process.executablePathAlloc(spawn.io, spawn.allocator) catch return false;
     defer spawn.allocator.free(self_exe);
     const root_z = spawn.allocator.dupeSentinel(u8, spawn.abs_root, 0) catch return false;
     defer spawn.allocator.free(root_z);
     var config_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
-    var argv: [7:null]?[*:0]const u8 = @splat(null);
+    var key_buf: [32]u8 = undefined;
+    const key_arg = cio.bufPrintZ(&key_buf, "--key={x:0>16}", .{key}) catch return false;
+    var argv: [8:null]?[*:0]const u8 = @splat(null);
     var argc: usize = 0;
-    for ([_][*:0]const u8{ self_exe.ptr, root_z.ptr, "mcp-server", "--lock-fd=3" }) |arg| {
+    for ([_][*:0]const u8{ self_exe.ptr, root_z.ptr, "mcp-server", "--lock-fd=3", key_arg.ptr }) |arg| {
         argv[argc] = arg;
         argc += 1;
     }
@@ -371,10 +373,19 @@ pub fn idleMsFromEnv() i64 {
 
 /// `--lock-fd=N` from the spawning client, if present among `args`.
 pub fn inheritedLockFd(args: []const []const u8) ?c_int {
+    const raw = flagValue(args, "--lock-fd=") orelse return null;
+    return std.fmt.parseInt(c_int, raw, 10) catch null;
+}
+
+/// `--key=HEX`: the key the spawning client waits on.
+pub fn spawnedKey(args: []const []const u8) ?u64 {
+    const raw = flagValue(args, "--key=") orelse return null;
+    return std.fmt.parseInt(u64, raw, 16) catch null;
+}
+
+fn flagValue(args: []const []const u8, prefix: []const u8) ?[]const u8 {
     for (args) |arg| {
-        if (std.mem.startsWith(u8, arg, "--lock-fd=")) {
-            return std.fmt.parseInt(c_int, arg["--lock-fd=".len..], 10) catch null;
-        }
+        if (std.mem.startsWith(u8, arg, prefix)) return arg[prefix.len..];
     }
     return null;
 }
@@ -394,9 +405,15 @@ pub const Server = struct {
 
     /// Null when another server owns the key or the socket cannot be bound;
     /// the caller then exits without loading anything.
-    pub fn bind(io: std.Io, abs_root: []const u8, cfg: Config, no_telemetry: bool, inherited_lock: ?c_int, idle_ms: i64) ?Server {
+    pub fn bind(io: std.Io, abs_root: []const u8, cfg: Config, no_telemetry: bool, inherited_lock: ?c_int, expected_key: ?u64, idle_ms: i64) ?Server {
         if (comptime !supported) return null;
         const key = serverKey(abs_root, cfg, no_telemetry, processEnvFingerprint());
+        // Serving another key would leave the spawning client waiting on a
+        // socket nobody binds; exiting frees its lock so it falls back at once.
+        if (expected_key) |want| if (want != key) {
+            std.log.warn("codedb mcp-server: key {x:0>16} differs from the client's {x:0>16}; exiting", .{ key, want });
+            return null;
+        };
         const ep = Endpoint.init(io, key) catch return null;
         var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
         const lock_path = ep.path(&lock_buf, "lock") orelse return null;
@@ -427,6 +444,7 @@ pub const Server = struct {
     /// Admission and the idle verdict share this thread, so a client accepted
     /// before the verdict always keeps the server alive.
     pub fn serve(self: *Server, handler: anytype) void {
+        if (comptime !supported) return;
         // The index load ran before this; clients queued during it count as new.
         self.mu.lock();
         self.idle_since_ms = cio.milliTimestamp();
@@ -542,6 +560,8 @@ test "mcp shared: lock fd argument parsing" {
     try testing.expectEqual(@as(?c_int, 3), inheritedLockFd(&.{ "--no-telemetry", "--lock-fd=3" }));
     try testing.expectEqual(@as(?c_int, null), inheritedLockFd(&.{"--lock-fd=x"}));
     try testing.expectEqual(@as(?c_int, null), inheritedLockFd(&.{}));
+    try testing.expectEqual(@as(?u64, 0xab), spawnedKey(&.{ "--lock-fd=3", "--key=00000000000000ab" }));
+    try testing.expectEqual(@as(?u64, null), spawnedKey(&.{"--key=zz"}));
 }
 
 const EchoHandler = struct {
@@ -574,8 +594,9 @@ test "mcp shared: server greets, serves, and retires once idle" {
     cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", try std.fmt.bufPrint(&env_buf, "{s}/run", .{dir_buf[0..dir_len]}));
     defer if (prev_dir) |d| cio.posixSetenv("CODEDB_MCP_SOCKET_DIR", d) else cio.posixUnsetenv("CODEDB_MCP_SOCKET_DIR");
 
-    var server = Server.bind(io, "/shared-test-root", Config.default, true, null, 300) orelse return error.TestUnexpectedResult;
-    try testing.expect(Server.bind(io, "/shared-test-root", Config.default, true, null, 300) == null);
+    var server = Server.bind(io, "/shared-test-root", Config.default, true, null, null, 300) orelse return error.TestUnexpectedResult;
+    try testing.expect(Server.bind(io, "/shared-test-root", Config.default, true, null, null, 300) == null);
+    try testing.expect(Server.bind(io, "/shared-test-root", Config.default, true, null, server.key +% 1, 300) == null);
 
     var returned = std.atomic.Value(bool).init(false);
     const serve_thread = try std.Thread.spawn(.{}, serveEcho, .{ &server, &returned });
@@ -599,7 +620,7 @@ test "mcp shared: server greets, serves, and retires once idle" {
     serve_thread.join();
     try testing.expect(attach(server.sockPath(), server.key) == .absent);
     // serve released the key, so the next server can take it at once.
-    const next = Server.bind(io, "/shared-test-root", Config.default, true, null, 300) orelse return error.TestUnexpectedResult;
+    const next = Server.bind(io, "/shared-test-root", Config.default, true, null, null, 300) orelse return error.TestUnexpectedResult;
     _ = std.c.close(next.listen_fd);
     _ = std.c.close(next.lock_fd);
 }

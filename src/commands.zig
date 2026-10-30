@@ -454,8 +454,8 @@ pub fn runMcp(ctx: *RunCtx) !void {
 /// Hidden command that `codedb mcp` forwards to: one index for every client
 /// of its key, exiting after CODEDB_MCP_IDLE_MS without a client.
 pub fn runMcpServer(ctx: *RunCtx) !void {
-    const lock_fd = mcp_shared.inheritedLockFd(ctx.args[ctx.cmd_args_start..]);
-    var shared = mcp_shared.Server.bind(ctx.io, ctx.abs_root, ctx.cfg, ctx.no_telemetry, lock_fd, mcp_shared.idleMsFromEnv()) orelse {
+    const args = ctx.args[ctx.cmd_args_start..];
+    var shared = mcp_shared.Server.bind(ctx.io, ctx.abs_root, ctx.cfg, ctx.no_telemetry, mcp_shared.inheritedLockFd(args), mcp_shared.spawnedKey(args), mcp_shared.idleMsFromEnv()) orelse {
         std.log.info("codedb mcp-server: another server owns this key, or its socket cannot be bound; exiting", .{});
         return;
     };

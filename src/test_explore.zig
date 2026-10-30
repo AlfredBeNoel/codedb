@@ -3295,8 +3295,96 @@ test "issue-656: call graph is stale and dangling after a file edit" {
     );
 
     const after = try explorer_inst.findCallPath("alpha", "beta", testing.allocator, 4);
-    defer if (after) |steps| testing.allocator.free(steps);
+    defer if (after) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
     try testing.expect(after != null);
+}
+
+test "call paths resolve from disk after contents are released" {
+    var project = testing.tmpDir(.{});
+    defer project.cleanup();
+    // Every hop lives in its own file, so each body must outlive later reads.
+    const files = [_][2][]const u8{
+        .{ "chain_a.zig", "pub fn alpha() void {\n    beta();\n}\n" },
+        .{ "chain_b.zig", "pub fn beta() void {\n    // second hop\n    gamma();\n}\n" },
+        .{ "chain_c.zig", "pub fn gamma() void {\n    // third hop, longer comment\n    delta();\n}\n" },
+        .{ "chain_d.zig", "pub fn delta() void {\n    // last hop\n    epsilon();\n}\n" },
+        .{ "chain_e.zig", "pub fn epsilon() void {}\n" },
+        .{ "data.json", "{\"alpha\": 1}\n" },
+    };
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    for (files) |f| try project.dir.writeFile(io, .{ .sub_path = f[0], .data = f[1] });
+    const root = root_buf[0..try project.dir.realPathFile(io, ".", &root_buf)];
+
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.setRoot(io, root);
+    for (files) |f| try explorer_inst.indexFile(f[0], f[1]);
+    explorer_inst.releaseContents();
+
+    const path = (try explorer_inst.findCallPath("alpha", "epsilon", testing.allocator, 5)) orelse
+        return error.TestExpectedEqual;
+    defer Explorer.freeCallPathSteps(testing.allocator, path);
+    const expected = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon" };
+    try testing.expectEqual(expected.len, path.len);
+    for (expected, path) |name, step| try testing.expectEqualStrings(name, step.name);
+}
+
+test "removing a file drops the cached call graph" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("caller.zig", "pub fn alpha() void {\n    beta();\n}\n");
+    try explorer_inst.indexFile("callee.zig", "pub fn beta() void {}\n");
+    const before = (try explorer_inst.findCallPath("alpha", "beta", testing.allocator, 5)) orelse
+        return error.TestExpectedEqual;
+    Explorer.freeCallPathSteps(testing.allocator, before);
+
+    explorer_inst.removeFile("callee.zig");
+    const after = try explorer_inst.findCallPath("alpha", "beta", testing.allocator, 5);
+    defer if (after) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
+    try testing.expect(after == null);
+}
+
+test "call path results stay valid after the graph is dropped" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("caller.zig", "pub fn alpha() void {\n    beta();\n}\n");
+    try explorer_inst.indexFile("callee.zig", "pub fn beta() void {}\n");
+    try explorer_inst.indexFile("other.zig", "pub fn other() void {}\n");
+    const steps = (try explorer_inst.findCallPath("alpha", "beta", testing.allocator, 5)) orelse
+        return error.TestExpectedEqual;
+    defer Explorer.freeCallPathSteps(testing.allocator, steps);
+    const candidates = try explorer_inst.findCallPathCandidates("beta", null, testing.allocator);
+    defer Explorer.freeCallPathSteps(testing.allocator, candidates);
+
+    explorer_inst.removeFile("other.zig");
+    try testing.expectEqualStrings("caller.zig", steps[0].path);
+    try testing.expectEqualStrings("alpha", steps[0].name);
+    try testing.expectEqualStrings("callee.zig", steps[1].path);
+    try testing.expectEqualStrings("beta", steps[1].name);
+    try testing.expectEqualStrings("callee.zig", candidates[0].path);
+}
+
+test "trigramAdmits keeps admission for indexed files and caps new ones" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("admitted.zig", "pub fn admitted() void {}\n");
+    try explorer_inst.indexFileSkipTrigram("skipped.zig", "pub fn skipped() void {}\n");
+
+    try testing.expect(explorer_inst.trigramAdmits("admitted.zig", 1));
+    try testing.expect(!explorer_inst.trigramAdmits("skipped.zig", 100));
+    try testing.expect(!explorer_inst.trigramAdmits("new.zig", 1));
+    try testing.expect(explorer_inst.trigramAdmits("new.zig", 2));
+}
+
+test "removeFileIfIndexed leaves search caches alone for unknown paths" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("kept.zig", "pub fn kept() void {}\n");
+    const gen = explorer_inst.search_gen.load(.acquire);
+    explorer_inst.removeFileIfIndexed("never_indexed.zig");
+    try testing.expectEqual(gen, explorer_inst.search_gen.load(.acquire));
+    explorer_inst.removeFileIfIndexed("kept.zig");
+    try testing.expect(!explorer_inst.outlines.contains("kept.zig"));
 }
 
 test "Swift multiline bodies and initializers participate in call paths" {
@@ -3320,7 +3408,7 @@ test "Swift multiline bodies and initializers participate in call paths" {
 
     const path = (try explorer_inst.findCallPath("init", "configure", testing.allocator, 2)) orelse
         return error.TestExpectedEqual;
-    defer testing.allocator.free(path);
+    defer Explorer.freeCallPathSteps(testing.allocator, path);
     try testing.expectEqual(@as(usize, 2), path.len);
     try testing.expectEqualStrings("init", path[0].name);
     try testing.expectEqualStrings("configure", path[1].name);
@@ -3345,7 +3433,7 @@ test "issue-718: call paths do not cross languages through name collisions" {
     //   Zig handle -> Python route -> Zig parseRequest.
     // There is no same-language `route`, so the honest answer is no path.
     const path = try explorer_inst.findCallPath("handle", "parseRequest", testing.allocator, 4);
-    defer if (path) |steps| testing.allocator.free(steps);
+    defer if (path) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
     try testing.expect(path == null);
 }
 
@@ -3374,15 +3462,15 @@ test "issue-725: call graph resolves imported receiver and same-file helper" {
 
     const imported = (try explorer_inst.findCallPath("cmdServe", "run", testing.allocator, 4)) orelse
         return error.TestExpectedEqual;
-    defer testing.allocator.free(imported);
+    defer Explorer.freeCallPathSteps(testing.allocator, imported);
     try testing.expectEqual(@as(usize, 2), imported.len);
     try testing.expectEqualStrings("src/server.zig", imported[1].path);
 
     const real_chain = try explorer_inst.findCallPath("cmdServe", "serverOnly", testing.allocator, 4);
-    defer if (real_chain) |steps| testing.allocator.free(steps);
+    defer if (real_chain) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
     try testing.expect(real_chain != null);
     const fabricated_chain = try explorer_inst.findCallPath("cmdServe", "workspaceOnly", testing.allocator, 4);
-    defer if (fabricated_chain) |steps| testing.allocator.free(steps);
+    defer if (fabricated_chain) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
     try testing.expect(fabricated_chain == null);
 
     try explorer_inst.indexFile("src/mergequeue.zig",
@@ -3403,13 +3491,13 @@ test "issue-725: call graph resolves imported receiver and same-file helper" {
 
     const local = (try explorer_inst.findCallPath("enqueue", "persistLocked", testing.allocator, 4)) orelse
         return error.TestExpectedEqual;
-    defer testing.allocator.free(local);
+    defer Explorer.freeCallPathSteps(testing.allocator, local);
     try testing.expectEqualStrings("src/mergequeue.zig", local[1].path);
     const correct = try explorer_inst.findCallPath("enqueue", "correctOnly", testing.allocator, 4);
-    defer if (correct) |steps| testing.allocator.free(steps);
+    defer if (correct) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
     try testing.expect(correct != null);
     const wrong = try explorer_inst.findCallPath("enqueue", "wrongOnly", testing.allocator, 4);
-    defer if (wrong) |steps| testing.allocator.free(steps);
+    defer if (wrong) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
     try testing.expect(wrong == null);
 }
 
@@ -3440,12 +3528,12 @@ test "issue-725: call graph follows an exact Zig re-export chain" {
 
     const imported = (try explorer_inst.findCallPath("main", "run", testing.allocator, 4)) orelse
         return error.TestExpectedEqual;
-    defer testing.allocator.free(imported);
+    defer Explorer.freeCallPathSteps(testing.allocator, imported);
     try testing.expectEqual(@as(usize, 2), imported.len);
     try testing.expectEqualStrings("zigrep/src/exec/search_engine.zig", imported[1].path);
 
     const real_chain = try explorer_inst.findCallPath("main", "engineOnly", testing.allocator, 4);
-    defer if (real_chain) |steps| testing.allocator.free(steps);
+    defer if (real_chain) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
     try testing.expect(real_chain != null);
 }
 
@@ -3478,10 +3566,10 @@ test "issue-725: nested Zig imports are not module re-exports" {
 
     const real = (try explorer_inst.findCallPath("main", "run", testing.allocator, 4)) orelse
         return error.TestExpectedEqual;
-    defer testing.allocator.free(real);
+    defer Explorer.freeCallPathSteps(testing.allocator, real);
     try testing.expectEqualStrings("src/root.zig", real[1].path);
     const fabricated = try explorer_inst.findCallPath("main", "decoyOnly", testing.allocator, 4);
-    defer if (fabricated) |steps| testing.allocator.free(steps);
+    defer if (fabricated) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
     try testing.expect(fabricated == null);
 }
 
@@ -3508,14 +3596,14 @@ test "issue-725: Zig Thread.spawn callback adds a unique same-file edge" {
 
     const callback = (try explorer_inst.findCallPath("run", "connection", testing.allocator, 4)) orelse
         return error.TestExpectedEqual;
-    defer testing.allocator.free(callback);
+    defer Explorer.freeCallPathSteps(testing.allocator, callback);
     try testing.expectEqual(@as(usize, 2), callback.len);
     try testing.expectEqualStrings("src/server.zig", callback[1].path);
     const real_chain = try explorer_inst.findCallPath("run", "handle", testing.allocator, 4);
-    defer if (real_chain) |steps| testing.allocator.free(steps);
+    defer if (real_chain) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
     try testing.expect(real_chain != null);
     const decoy_chain = try explorer_inst.findCallPath("run", "decoyOnly", testing.allocator, 4);
-    defer if (decoy_chain) |steps| testing.allocator.free(steps);
+    defer if (decoy_chain) |steps| Explorer.freeCallPathSteps(testing.allocator, steps);
     try testing.expect(decoy_chain == null);
 }
 

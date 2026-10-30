@@ -1860,6 +1860,9 @@ pub const Explorer = struct {
     co_change: ?std.StringHashMap([]git.CoChangePartner) = null,
     co_change_attempted: bool = false,
     cochange_build_mu: cio.Mutex = .{},
+    /// Serializes rebuildWordIndex so concurrent misses wait for one build
+    /// instead of each reading every file into a private copy.
+    word_index_build_mu: cio.Mutex = .{},
     io: ?std.Io = null,
     /// When non-null, append one JSON line per searchContent invocation
     /// to this path (v0 rerank-trace experiment). Borrowed; caller owns
@@ -2863,6 +2866,13 @@ pub const Explorer = struct {
     /// by streaming source files from the project root when the content cache
     /// was capped during fast snapshot restore.
     pub fn rebuildWordIndex(self: *Explorer) !void {
+        self.word_index_build_mu.lock();
+        defer self.word_index_build_mu.unlock();
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            if (self.word_index_complete) return;
+        }
         const source_paths = blk: {
             self.mu.lockShared();
             defer self.mu.unlockShared();

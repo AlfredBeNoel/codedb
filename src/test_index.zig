@@ -3451,6 +3451,9 @@ test "mmap word index: edits overlay the base and match a rebuilt index" {
     const pfx = try mm.searchPrefix("gammaprefix", alloc, 10);
     defer alloc.free(pfx);
     try testing.expectEqual(@as(usize, 2), pfx.len);
+    const capped = try mm.searchPrefix("gammaprefix", alloc, 1);
+    defer alloc.free(capped);
+    try testing.expectEqualSlices(@import("index.zig").WordHit, pfx[0..1], capped);
 
     // A merged write of the overlay loads back as the rebuilt index.
     var tmp2 = testing.tmpDir(.{});

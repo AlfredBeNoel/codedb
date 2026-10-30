@@ -3722,3 +3722,24 @@ test "disk-backed line ranges do not reuse offsets for changed content" {
     try testing.expect(try ex.appendLineRange("fallback.zig", 2, 3, "       ", testing.allocator, &changed));
     try testing.expectEqualStrings("           2 | bbbb\n           3 | c\n", changed.items);
 }
+
+test "adoptPersistedWordIndex keeps BM25 stats of zero-token files" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn alphaToken() void { return; }\n");
+    try explorer.indexFile("src/b.zig", "a b c\n");
+    explorer.markWordIndexAsComplete();
+    const ranked = explorer.word_index.rankedDocCount();
+    const avg = explorer.word_index.avgDocLength();
+    try testing.expectEqual(@as(u32, 2), ranked);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pb[0..try tmp.dir.realPathFile(io, ".", &pb)];
+    const mapped = (try explorer.word_index.writeToDiskAndMap(io, dir, null, testing.allocator)).?;
+    explorer.adoptPersistedWordIndex(explorer.word_index_generation, mapped);
+    try testing.expect(explorer.word_index.mmap_data != null);
+    try testing.expectEqual(ranked, explorer.word_index.rankedDocCount());
+    try testing.expectEqual(avg, explorer.word_index.avgDocLength());
+}

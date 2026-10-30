@@ -3130,6 +3130,14 @@ pub const Explorer = struct {
             index.deinit();
             return;
         }
+        // The disk keeps no zero-token docs, but BM25 counts them in N and avgdl.
+        var lengths = self.word_index.doc_lengths.iterator();
+        while (lengths.next()) |e| {
+            if (e.value_ptr.* == 0) index.doc_lengths.put(e.key_ptr.*, 0) catch {
+                index.deinit();
+                return;
+            };
+        }
         index.skip_file_words = self.word_index.skip_file_words;
         index.enabled = self.word_index.enabled;
         self.word_index.deinit();

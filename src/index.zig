@@ -191,27 +191,36 @@ pub const WordIndex = struct {
         return false;
     }
 
+    /// Yields live base hits merged with a sorted delta, in (doc_id, line) order.
+    const MergedHits = struct {
+        wi: *const WordIndex,
+        base: []align(1) const WordHit,
+        delta: []const WordHit,
+        bi: usize = 0,
+        di: usize = 0,
+
+        fn next(m: *MergedHits) ?WordHit {
+            while (m.bi < m.base.len and m.wi.isDeadBase(m.base[m.bi].doc_id)) m.bi += 1;
+            const has_base = m.bi < m.base.len;
+            if (m.di < m.delta.len and (!has_base or hitLessThan({}, m.delta[m.di], m.base[m.bi]))) {
+                m.di += 1;
+                return m.delta[m.di - 1];
+            }
+            if (!has_base) return null;
+            m.bi += 1;
+            return m.base[m.bi - 1];
+        }
+    };
+
     /// Merge live base hits and the delta into `buf` (len >= base.len + delta.len).
     /// The delta is sorted in buf's tail first; the forward merge never overtakes it.
     fn mergeLive(self: *const WordIndex, base: []align(1) const WordHit, delta: []const WordHit, buf: []WordHit) []WordHit {
         const tail = buf[base.len..][0..delta.len];
         @memcpy(tail, delta);
         std.mem.sort(WordHit, tail, {}, hitLessThan);
+        var merged = MergedHits{ .wi = self, .base = base, .delta = tail };
         var w: usize = 0;
-        var d: usize = 0;
-        for (base) |h| {
-            if (self.isDeadBase(h.doc_id)) continue;
-            while (d < tail.len and hitLessThan({}, tail[d], h)) : (d += 1) {
-                buf[w] = tail[d];
-                w += 1;
-            }
-            buf[w] = h;
-            w += 1;
-        }
-        while (d < tail.len) : (d += 1) {
-            buf[w] = tail[d];
-            w += 1;
-        }
+        while (merged.next()) |h| : (w += 1) buf[w] = h;
         return buf[0..w];
     }
 
@@ -731,9 +740,12 @@ pub const WordIndex = struct {
             var words = OverlayWordIter{ .wi = self, .prefix = prefix, .base_pos = lo, .delta = delta_words };
             outer_mmap: while (words.next()) |entry| {
                 if (entry.word.len <= prefix.len) continue; // strictly longer; exact is Tier 0
-                const posts = try self.overlayHits(entry.base, entry.delta, allocator);
-                defer posts.deinit(allocator);
-                for (posts.items) |hit| {
+                // Stream the merge so the result cap bounds the work.
+                const delta = try allocator.dupe(WordHit, entry.delta);
+                defer allocator.free(delta);
+                std.mem.sort(WordHit, delta, {}, hitLessThan);
+                var posts = MergedHits{ .wi = self, .base = entry.base, .delta = delta };
+                while (posts.next()) |hit| {
                     const dk = DedupKey{ .doc_id = hit.doc_id, .line_num = hit.line_num };
                     const gop = try seen.getOrPut(dk);
                     if (!gop.found_existing) {

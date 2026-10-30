@@ -357,7 +357,7 @@ def main():
     }
     report = {'binary': binary, 'sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
               'source': args.source, 'args': vars(args), 'started': time.strftime('%Y-%m-%dT%H:%M:%S')}
-    procs = []
+    procs, fp = [], None
     try:
         t = time.monotonic()
         tracked = prepare_corpus(Path(args.source).resolve(), root, rng, args.alt_files)
@@ -440,6 +440,9 @@ def main():
         }
         report['stderr_tail'] = p.stderr_lines()[-40:]
     finally:
+        if fp is not None:
+            fp.stop.set()
+            report.setdefault('samples', fp.samples)
         for proc in procs:
             proc.close()
         if not args.keep:

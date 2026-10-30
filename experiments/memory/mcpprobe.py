@@ -51,6 +51,8 @@ class Session:
             "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
             "CODEDB_NO_TELEMETRY": "1",
             "CODEDB_NO_AUTO_UPDATE": "1",
+            # Footprint follows the spawned pid; in shared mode that is the stdio forwarder.
+            "CODEDB_MCP_SHARED": "0",
         }
         env.update(extra_env or {})
         self.stderr = open(stderr_path, "w")

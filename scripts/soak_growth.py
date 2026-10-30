@@ -361,6 +361,8 @@ def main():
         'HOME': str(home), 'PATH': os.environ['PATH'], 'TMPDIR': os.environ.get('TMPDIR', '/tmp'),
         'CODEDB_NO_AUTO_UPDATE': '1', 'CODEDB_NO_TELEMETRY': '1', 'CODEDB_NO_CLI_DAEMON': '1',
         'CODEDB_NO_CODEX_POLICY': '1', 'CODEDB_EMBEDDINGS_URL': 'http://127.0.0.1:9/v1/embeddings',
+        # Footprint follows the spawned pid; in shared mode that is the stdio forwarder.
+        'CODEDB_MCP_SHARED': '0',
     }
     report = {'binary': binary, 'sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
               'source': args.source, 'args': vars(args), 'started': time.strftime('%Y-%m-%dT%H:%M:%S')}

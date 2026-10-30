@@ -1363,8 +1363,9 @@ def run_scenario_10_branch_switch_reconcile(binary: str, project: str) -> list[T
         git(root, "commit", "-q", "-m", "alt")
         git(root, "checkout", "-q", "base")
         # A cap below the file count leaves later files outside the trigram index.
+        # In-process: the checks read watcher lines, which a shared server logs to its own file.
         p = MCPProcess(binary, [], cwd="/", command=[binary, str(root), "mcp", "--no-telemetry"],
-                       env={**os.environ, "CODEDB_TRIGRAM_CAP": str(unchanged // 2)})
+                       env={**os.environ, "CODEDB_TRIGRAM_CAP": str(unchanged // 2), "CODEDB_MCP_SHARED": "0"})
 
         try:
             r = t("initial scan completes")

@@ -323,20 +323,6 @@ pub const ContentCache = struct {
         self.owned_bytes = 0;
     }
 
-    /// Drops only cache-owned values. Borrowed values stay: they cost no heap,
-    /// and a dropped one would come back as a heap copy read from disk.
-    pub fn clearOwned(self: *ContentCache) void {
-        for (self.slots) |*slot| {
-            if (slot.present and slot.value_owned) {
-                self.allocator.free(slot.key);
-                self.allocator.free(slot.value);
-                slot.* = empty_slot;
-                self.count_ -= 1;
-            }
-        }
-        self.owned_bytes = 0;
-    }
-
     pub fn len(self: *const ContentCache) u32 {
         return self.count_;
     }
@@ -454,20 +440,6 @@ test "ContentCache: clear drops all entries" {
     cache.clear();
     try std.testing.expectEqual(@as(u32, 0), cache.len());
     try std.testing.expect(cache.get("a") == null);
-}
-
-test "ContentCache: clearOwned drops owned values and keeps borrowed ones" {
-    var cache = try ContentCache.initAlloc(std.testing.allocator, 64);
-    defer cache.deinit();
-
-    const borrowed: []const u8 = "mapped snapshot bytes";
-    try cache.putBorrowed("mapped", borrowed);
-    try cache.put("edited", "heap copy");
-    cache.clearOwned();
-    try std.testing.expectEqual(@as(u32, 1), cache.len());
-    try std.testing.expect(cache.get("edited") == null);
-    try std.testing.expectEqual(borrowed.ptr, cache.get("mapped").?.ptr);
-    try std.testing.expectEqual(@as(usize, 0), cache.stats().owned_bytes);
 }
 
 test "ContentCache: iterator visits all present entries" {

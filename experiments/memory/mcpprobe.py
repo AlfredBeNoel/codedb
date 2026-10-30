@@ -207,6 +207,22 @@ def cmd_queries(a):
         s.wait_ready(a.ready_timeout)
         for call in calls:
             outputs.append({"tool": call["tool"], "args": call["args"], "output": s.call_tool(call["tool"], call["args"])})
+        if a.edit:
+            # Same edit as `mem --edit`; every call runs again on the edited index.
+            target = os.path.join(a.root, a.edit)
+            original = open(target, "rb").read()
+            original_stat = os.stat(target)
+            try:
+                with open(target, "ab") as f:
+                    f.write(b"\n// memprobe edit\n")
+                time.sleep(a.edit_settle)
+                for call in calls:
+                    outputs.append({"tool": call["tool"], "args": call["args"], "after_edit": True,
+                                    "output": s.call_tool(call["tool"], call["args"])})
+            finally:
+                with open(target, "wb") as f:
+                    f.write(original)
+                os.utime(target, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
     finally:
         s.close()
     with open(a.out, "w") as f:
@@ -236,6 +252,8 @@ def main():
             sp.add_argument("--edit-settle", type=float, default=15)
         else:
             sp.add_argument("--calls", required=True)
+            sp.add_argument("--edit", default="")
+            sp.add_argument("--edit-settle", type=float, default=5)
     a = p.parse_args()
     {"mem": cmd_mem, "queries": cmd_queries}[a.cmd](a)
 

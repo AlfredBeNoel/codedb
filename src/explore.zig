@@ -2124,16 +2124,6 @@ pub const Explorer = struct {
         self.line_offsets.clear();
     }
 
-    /// Keeps contents borrowed from the snapshot mmap: they cost no heap, and
-    /// dropping them makes every later read copy the file from disk into heap.
-    pub fn releaseOwnedContents(self: *Explorer) void {
-        self.mu.lock();
-        defer self.mu.unlock();
-        self.contents.clearOwned();
-        self.content_hashes.clear();
-        self.line_offsets.clear();
-    }
-
     pub fn releaseSecondaryIndexes(self: *Explorer) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -6106,8 +6096,9 @@ pub const Explorer = struct {
         var it = self.outlines.iterator();
         while (it.next()) |entry| {
             const path = entry.key_ptr.*;
+            // No per-file free: `funcs` keeps body slices of this content until
+            // after the loop, and the arena releases every body at once.
             const ref = self.readContentForSearch(path, a) orelse continue;
-            defer ref.deinit();
             const content = ref.data;
             const direct_import_bindings = if (exact)
                 self.callGraphZigImportBindings(entry.value_ptr, content, a) catch &.{}

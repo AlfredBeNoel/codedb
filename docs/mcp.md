@@ -514,6 +514,38 @@ Override the default:
   full design + safety logic for project-root detection
 - [Telemetry](telemetry.md) — what codedb sends, how to disable
 
+## Shared server: one index per project root
+
+Each agent starts its own `codedb mcp`. On macOS and Linux, all `codedb mcp`
+processes for one project root now share one index. The first one starts a
+background `codedb <root> mcp-server`. Each `codedb mcp` then only copies its
+stdio to that server over a Unix socket and uses about 1 MB. The server keeps
+one index and one watcher. It gives each client its own MCP session, so request
+ids, `initialize`, `roots/list` and the per-call `project` argument work as
+before.
+
+Clients share a server only when they would run the same server: the same
+codedb version, root, `.codedbrc` and config values, `--no-telemetry`, and
+`CODEDB_*` environment. Clients that differ get separate servers.
+
+The server stops after 5 minutes without a client. When it cannot be reached
+or started, `codedb mcp` serves in-process as before and logs the reason to
+stderr, for example `shared server unavailable (SocketDirNotWritable)`.
+
+Sharing applies to roots that are known at launch: a positional root,
+`CODEDB_ROOT`, or the git root of the working directory. It does not apply to
+`CODEDB_LAZY_MCP=1` or to roots that come only from the client's `roots/list`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CODEDB_MCP_SHARED` | on | `0` serves every session in-process. |
+| `CODEDB_MCP_SOCKET_DIR` | `~/.codedb/run` | Directory (mode 0700) for `<key>.sock`, `<key>.lock` and the server log `<key>.log`. The socket path must fit in 104 bytes. |
+| `CODEDB_MCP_IDLE_MS` | `300000` | Time without a client before the server exits. |
+
+Look at `~/.codedb/run/<key>.log` when a server misbehaves. `pkill -f
+'codedb .* mcp-server'` stops all shared servers. Their clients then lose the
+session and the MCP client restarts `codedb mcp`.
+
 ## Experimental lazy startup
 
 Set `CODEDB_LAZY_MCP=1` in your client's codedb MCP server environment, preserving
@@ -538,6 +570,6 @@ watchers continue normally once started.
 
 Lazy sessions skip speculative warmup and the MCP process's CLI proxy. CLI calls
 use their existing standalone/daemon fallback, which can increase startup cost.
-This option helps sessions that never query code; it does not share worktree
-indexes, consolidate processes, change retrieval ranking, or reduce active
-watcher work.
+This option helps sessions that never query code. Lazy sessions do not use the
+shared server, and the option does not change retrieval ranking or reduce
+active watcher work.

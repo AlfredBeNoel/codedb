@@ -357,9 +357,9 @@ fn sha256FileHex(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]
 
 // ── Auto-update ──────────────────────────────────────────────────────────────
 //
-// On startup we kick off a detached check that shells out to the public
-// install.sh. The check is:
-//   • disabled when CODEDB_NO_AUTO_UPDATE is set in the environment
+// When opted in, MCP startup kicks off a detached check that shells out to the
+// public install.sh. The check is:
+//   • off unless CODEDB_AUTO_UPDATE=1; CODEDB_NO_AUTO_UPDATE turns it off either way
 //   • throttled to at most once every 24 hours, tracked in
 //     ~/.codedb/last_auto_update_check (a u64 little-endian unix-ms timestamp)
 // The update itself runs in a background thread so it never blocks server
@@ -371,10 +371,18 @@ const auto_update_install_url = "https://codedb.codegraff.com/install.sh";
 const auto_update_throttle_ms: i64 = 24 * 60 * 60 * 1000;
 const auto_update_stamp_filename = "last_auto_update_check";
 
+/// Off by default: install.sh installs the upstream release, which would
+/// replace a fork build. CODEDB_NO_AUTO_UPDATE wins over CODEDB_AUTO_UPDATE.
+pub fn autoUpdateOptedIn(auto_update: ?[]const u8, no_auto_update: ?[]const u8) bool {
+    if (no_auto_update != null) return false;
+    const value = auto_update orelse return false;
+    return std.mem.eql(u8, value, "1");
+}
+
 /// Pure decision function — useful for tests. Returns true when the next
 /// auto-update attempt should fire.
-pub fn shouldRunAutoUpdate(now_ms: i64, last_check_ms: ?i64, env_disabled: bool) bool {
-    if (env_disabled) return false;
+pub fn shouldRunAutoUpdate(now_ms: i64, last_check_ms: ?i64, opted_in: bool) bool {
+    if (!opted_in) return false;
     const last = last_check_ms orelse return true;
     if (last > now_ms) return true;
     const delta: i128 = @as(i128, now_ms) - @as(i128, last);
@@ -382,7 +390,8 @@ pub fn shouldRunAutoUpdate(now_ms: i64, last_check_ms: ?i64, env_disabled: bool)
 }
 
 pub fn maybeAutoUpdate(io: std.Io, allocator: std.mem.Allocator) void {
-    const env_disabled = cio.posixGetenv("CODEDB_NO_AUTO_UPDATE") != null;
+    const opted_in = autoUpdateOptedIn(cio.posixGetenv("CODEDB_AUTO_UPDATE"), cio.posixGetenv("CODEDB_NO_AUTO_UPDATE"));
+    if (!opted_in) return;
     const home = cio.homeDir() orelse return;
     if (home.len == 0) return;
 
@@ -395,7 +404,7 @@ pub fn maybeAutoUpdate(io: std.Io, allocator: std.mem.Allocator) void {
 
     const last_ms = readAutoUpdateStamp(io, stamp_path);
     const now_ms = cio.milliTimestamp();
-    if (!shouldRunAutoUpdate(now_ms, last_ms, env_disabled)) return;
+    if (!shouldRunAutoUpdate(now_ms, last_ms, opted_in)) return;
 
     // Persist the new timestamp before launching so concurrent invocations
     // don't all race the same check.

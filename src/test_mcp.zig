@@ -429,22 +429,33 @@ test "issue-624: convergence governor flags a repeated identical call" {
 test "auto-update: shouldRunAutoUpdate gates correctly" {
     const day_ms: i64 = 24 * 60 * 60 * 1000;
 
-    // Disabled by env: never runs
-    try testing.expect(!update_mod.shouldRunAutoUpdate(0, null, true));
-    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms * 100, null, true));
-    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms * 100, 0, true));
+    // Not opted in: never runs
+    try testing.expect(!update_mod.shouldRunAutoUpdate(0, null, false));
+    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms * 100, null, false));
+    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms * 100, 0, false));
 
-    // First run (no stamp): always runs when not disabled
-    try testing.expect(update_mod.shouldRunAutoUpdate(0, null, false));
+    // First run (no stamp): always runs when opted in
+    try testing.expect(update_mod.shouldRunAutoUpdate(0, null, true));
 
     // Throttled: <24h since last check → skip
-    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms - 1, 0, false));
+    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms - 1, 0, true));
 
     // Exactly 24h since last check → run
-    try testing.expect(update_mod.shouldRunAutoUpdate(day_ms, 0, false));
+    try testing.expect(update_mod.shouldRunAutoUpdate(day_ms, 0, true));
 
     // Long after last check → run
-    try testing.expect(update_mod.shouldRunAutoUpdate(day_ms * 7, 0, false));
+    try testing.expect(update_mod.shouldRunAutoUpdate(day_ms * 7, 0, true));
+}
+
+test "auto-update: off unless CODEDB_AUTO_UPDATE=1, and CODEDB_NO_AUTO_UPDATE wins" {
+    try testing.expect(!update_mod.autoUpdateOptedIn(null, null));
+    try testing.expect(update_mod.autoUpdateOptedIn("1", null));
+    try testing.expect(!update_mod.autoUpdateOptedIn("0", null));
+    try testing.expect(!update_mod.autoUpdateOptedIn("", null));
+    try testing.expect(!update_mod.autoUpdateOptedIn("true", null));
+    try testing.expect(!update_mod.autoUpdateOptedIn("1", "1"));
+    try testing.expect(!update_mod.autoUpdateOptedIn("1", ""));
+    try testing.expect(!update_mod.autoUpdateOptedIn(null, "1"));
 }
 
 test "issue-394: shouldRunAutoUpdate permanently blocked by future-timestamp stamp file" {
@@ -464,7 +475,7 @@ test "issue-394: shouldRunAutoUpdate permanently blocked by future-timestamp sta
     const now_ms: i64 = 1_700_000_000_000;
     const future_last_ms: i64 = now_ms + day_ms * 30; // 30 days in the future
 
-    try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, future_last_ms, false));
+    try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, future_last_ms, true));
 }
 
 test "issue-395: shouldRunAutoUpdate panics on i64 underflow when stamp is corrupt" {
@@ -489,7 +500,7 @@ test "issue-395: shouldRunAutoUpdate panics on i64 underflow when stamp is corru
     const now_ms: i64 = 1_700_000_000_000;
     const last_ms: i64 = std.math.minInt(i64);
 
-    try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, last_ms, false));
+    try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, last_ms, true));
 }
 
 test "issue-150: --help prints usage" {

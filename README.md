@@ -290,7 +290,9 @@ backed by api.wiki.codes was removed; DeepWiki replaces that role.)
 
 **Options:** `--no-telemetry` (or set `CODEDB_NO_TELEMETRY` env var)
 
-**Claude Code hook opt-out:** the installer registers a PreToolUse hook that nudges agents from `grep`/`cat` to codedb inside indexed repos. `CODEDB_NO_HOOKS=1` skips it for that run only (it is never persisted from the environment, so a transient export can't be promoted to a permanent opt-out by the background auto-updater). To make it permanent, run the installer with `CODEDB_PERSIST_NO_HOOKS=1` or `touch ~/.codedb/no-hooks`; `rm ~/.codedb/no-hooks` re-enables it. Deleting the hook entry from `~/.claude/settings.json` is also permanent — the installer records its registrations and treats a missing entry as a deliberate removal (it writes `~/.codedb/no-hooks` for you, so `rm` that file to undo).
+**Auto-update:** off by default. With `CODEDB_AUTO_UPDATE=1`, `codedb mcp` runs the public installer in the background at most once every 24 hours; `CODEDB_NO_AUTO_UPDATE` turns it off even then. `codedb update` always works on demand.
+
+**Claude Code hook opt-out:** the installer registers a PreToolUse hook that nudges agents from `grep`/`cat` to codedb inside indexed repos. `CODEDB_NO_HOOKS=1` skips it for that run only (it is never persisted from the environment, so a transient export can't be promoted to a permanent opt-out by the opt-in background auto-updater). To make it permanent, run the installer with `CODEDB_PERSIST_NO_HOOKS=1` or `touch ~/.codedb/no-hooks`; `rm ~/.codedb/no-hooks` re-enables it. Deleting the hook entry from `~/.claude/settings.json` is also permanent — the installer records its registrations and treats a missing entry as a deliberate removal (it writes `~/.codedb/no-hooks` for you, so `rm` that file to undo).
 
 ### Example: agent explores a codebase
 

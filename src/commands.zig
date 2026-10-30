@@ -503,9 +503,9 @@ fn serveMcp(ctx: *RunCtx, transport: McpTransport) !void {
     const cfg = ctx.cfg;
     const no_telemetry = ctx.no_telemetry;
     const mcp_deferred_root = ctx.mcp_deferred_root;
-    // Background auto-update check (no-op when CODEDB_NO_AUTO_UPDATE is set
-    // or when the last check was within the last 24h). Detached thread, so
-    // this doesn't block server startup.
+    // Background auto-update check (no-op unless CODEDB_AUTO_UPDATE=1, or when
+    // the last check was within the last 24h). Detached thread, so this
+    // doesn't block server startup.
     update_mod.maybeAutoUpdate(io, allocator);
 
     var agents = AgentRegistry.init(allocator);
